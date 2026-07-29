@@ -253,6 +253,28 @@ def render_session_png(
         dst_w = max(1, round(float(geom["width"]) * out_scale))
         dst_h = max(1, round(float(geom["height"]) * out_scale))
 
+        if dst_x == 0 and dst_y == 0 and src_w == dst_w == out_w and src_h == dst_h == out_h:
+            canvas[:] = raw
+            continue
+
+        if src_w == dst_w:
+            source_stride = src_w * 4
+            for y in range(dst_h):
+                out_y = dst_y + y
+                if out_y < 0 or out_y >= out_h:
+                    continue
+                source_start = y * source_stride
+                source_x = max(0, -dst_x)
+                destination_x = max(0, dst_x)
+                copy_width = min(src_w - source_x, out_w - destination_x)
+                if copy_width <= 0:
+                    continue
+                source_start += source_x * 4
+                destination_start = (out_y * out_w + destination_x) * 4
+                byte_count = copy_width * 4
+                canvas[destination_start : destination_start + byte_count] = raw[source_start : source_start + byte_count]
+            continue
+
         for y in range(dst_h):
             sy = min(src_h - 1, int(y * src_h / dst_h))
             out_y = dst_y + y

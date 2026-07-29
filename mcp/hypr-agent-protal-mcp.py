@@ -2,6 +2,7 @@
 import base64
 import copy
 import json
+import math
 import mimetypes
 import os
 import pathlib
@@ -16,11 +17,14 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SERVER_VERSION = "0.3.44"
+SERVER_VERSION = "0.3.45"
 SNAPSHOTS: dict[str, dict[str, Any]] = {}
 GLOBAL_MENU_LIMIT = 80
+GLOBAL_MENU_TREE_TIMEOUT_SECONDS = 0.2
 DEFAULT_MODEL_SCREENSHOT_RESOLUTION = "logical"
 GEOMETRY_EPSILON = 0.5
+MAX_TOOL_WAIT_SECONDS = 30.0
+LAUNCH_UNMATCHED_WINDOW_GRACE_SECONDS = 1.0
 
 _ATSPI_INIT_ERROR: str | None | bool = None
 _ATSPI: Any = None
@@ -119,7 +123,12 @@ COMPUTER_SCHEMA: dict[str, Any] = {
         "url": {"type": "string", "description": "URL or file target to pass to a launched app, usually with new_window for browsers."},
         "new_window": {"type": "boolean", "default": True, "description": "For browser launches, request a new window and use about:blank when no URL is supplied."},
         "reuse_existing": {"type": "boolean", "default": True, "description": "For launch/open_app, return an already running matching app instead of forcing a new launch. Set false only when the user explicitly asks for a new instance/window."},
-        "timeout": {"type": "number", "description": "Seconds to wait for a launched app window to appear."},
+        "timeout": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": MAX_TOOL_WAIT_SECONDS,
+            "description": "Seconds to wait for a launched app window to appear. Values are capped at 30 seconds.",
+        },
         "target": {
             "type": "string",
             "description": "Low-level Hyprland window selector, for example address:0x1234. Prefer app plus screenshot/window-relative coordinates unless you intentionally need global-coordinate fallback.",
@@ -232,6 +241,10 @@ def number_property(description: str) -> dict[str, Any]:
     return {"type": "number", "description": description}
 
 
+def timeout_property(description: str) -> dict[str, Any]:
+    return {"type": "number", "minimum": 0, "maximum": MAX_TOOL_WAIT_SECONDS, "description": description}
+
+
 def integer_property(description: str) -> dict[str, Any]:
     return {"type": "integer", "description": description}
 
@@ -284,7 +297,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             "url": string_property("Optional URL or file target to pass to the launched app."),
             "new_window": {"type": "boolean", "default": True, "description": "For browsers, request a new window and open about:blank when no URL is supplied. Use only when launching a new browser window is intended."},
             "reuse_existing": {"type": "boolean", "default": True, "description": "Return an already running matching app instead of launching another copy. Set false only when the user explicitly asks for a new instance/window."},
-            "timeout": number_property("Seconds to wait for a Hyprland window to appear. Defaults to 8."),
+            "timeout": timeout_property("Seconds to wait for a Hyprland window to appear. Defaults to 8; capped at 30."),
         }
     )
     element_index = string_property("Element index from the last get_app_state result.")
@@ -584,7 +597,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "related_to": string_property("Root app/window selector whose related popup/dialog should appear."),
                     "title": string_property("Window title substring to wait for."),
                     "class": string_property("Window class substring to wait for."),
-                    "timeout": number_property("Seconds to wait. Defaults to 5."),
+                    "timeout": timeout_property("Seconds to wait. Defaults to 5; capped at 30."),
                 }
             ),
         },
@@ -597,7 +610,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "app": app,
                     "target": string_property("Target window selector to wait for close, for example address:0x1234."),
                     "related_to": string_property("Root app/window selector to return after the target closes."),
-                    "timeout": number_property("Seconds to wait. Defaults to 5."),
+                    "timeout": timeout_property("Seconds to wait. Defaults to 5; capped at 30."),
                 }
             ),
         },
@@ -613,7 +626,18 @@ def error(req_id: Any, code: int, message: str) -> dict[str, Any]:
 
 
 def call_ctl(args: list[str]) -> dict[str, Any]:
-    proc = subprocess.run([str(find_ctl()), *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False)
+    try:
+        proc = subprocess.run(
+            [str(find_ctl()), *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=hyprctl_environment(),
+            check=False,
+            timeout=MAX_TOOL_WAIT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"hypr-agent-protalctl timed out after {MAX_TOOL_WAIT_SECONDS:g}s") from exc
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or f"hypr-agent-protalctl exited {proc.returncode}").strip())
     if not proc.stdout.strip():
@@ -657,6 +681,15 @@ def run_capture(command: str, args: list[str], *, timeout: float = 5.0) -> tuple
     if proc.returncode != 0:
         return False, b""
     return True, proc.stdout
+
+
+def bounded_timeout_seconds(value: Any, default: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    seconds = float(value)
+    if not math.isfinite(seconds):
+        return default
+    return max(0.0, min(seconds, MAX_TOOL_WAIT_SECONDS))
 
 
 def busctl_user(args: list[str], *, timeout: float = 2.0) -> tuple[bool, str]:
@@ -1156,7 +1189,18 @@ def hyprctl_exec(command: str) -> str:
         dispatch_args = [hyprctl, "dispatch", f"hl.dsp.exec_cmd({lua_quote(command)})"]
     else:
         dispatch_args = [hyprctl, "dispatch", "exec", command]
-    proc = subprocess.run(dispatch_args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
+    try:
+        proc = subprocess.run(
+            dispatch_args,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+            timeout=MAX_TOOL_WAIT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"hyprctl launch dispatch timed out after {MAX_TOOL_WAIT_SECONDS:g}s") from exc
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or f"{' '.join(dispatch_args[:3])} failed with exit code {proc.returncode}").strip())
     return proc.stdout.strip()
@@ -1188,9 +1232,11 @@ def window_matches_launch(window: dict[str, Any], query: str) -> bool:
 
 
 def wait_for_launch_window(before_ids: set[str], query: str, timeout: float, *, allow_existing_fallback: bool = True) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    deadline = time.monotonic() + max(0.0, timeout)
+    effective_timeout = bounded_timeout_seconds(timeout, 8.0)
+    deadline = time.monotonic() + effective_timeout
     latest: list[dict[str, Any]] = []
     last_new_windows: list[dict[str, Any]] = []
+    first_unmatched_window_at: float | None = None
     while True:
         latest = list_hypr_windows()
         new_windows = [window for window in latest if not (window_identities([window]) & before_ids)]
@@ -1203,7 +1249,14 @@ def wait_for_launch_window(before_ids: set[str], query: str, timeout: float, *, 
             matching_existing = [window for window in latest if window_matches_launch(window, query)]
             if matching_existing:
                 return matching_existing[0], []
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if new_windows and first_unmatched_window_at is None:
+            first_unmatched_window_at = now
+        if last_new_windows and first_unmatched_window_at is not None and now - first_unmatched_window_at >= min(
+            LAUNCH_UNMATCHED_WINDOW_GRACE_SECONDS, effective_timeout
+        ):
+            return last_new_windows[0], last_new_windows
+        if now >= deadline:
             if last_new_windows:
                 return last_new_windows[0], last_new_windows
             return None, []
@@ -1379,7 +1432,7 @@ def dbus_services_for_pid(pid: int) -> list[str]:
 
 
 def dbus_tree_paths(service: str) -> list[str]:
-    ok, out = busctl_user(["tree", service], timeout=2.0)
+    ok, out = busctl_user(["tree", service], timeout=GLOBAL_MENU_TREE_TIMEOUT_SECONDS)
     if not ok:
         return []
     paths: list[str] = []
@@ -2055,7 +2108,18 @@ def screenshot_for_window(window: dict[str, Any]) -> tuple[dict[str, Any], str]:
 
 
 def hyprctl_json(*args: str) -> Any:
-    proc = subprocess.run(["hyprctl", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False)
+    try:
+        proc = subprocess.run(
+            ["hyprctl", *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=hyprctl_environment(),
+            check=False,
+            timeout=MAX_TOOL_WAIT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"hyprctl {' '.join(args)} timed out after {MAX_TOOL_WAIT_SECONDS:g}s") from exc
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or f"hyprctl {' '.join(args)} failed").strip())
     return json.loads(proc.stdout or "null")
@@ -3783,8 +3847,7 @@ def tool_launch_app(args: dict[str, Any]) -> dict[str, Any]:
     reuse_existing = args.get("reuse_existing")
     if not isinstance(reuse_existing, bool):
         reuse_existing = True
-    timeout_value = args.get("timeout", 8)
-    timeout = float(timeout_value) if isinstance(timeout_value, (int, float)) else 8.0
+    timeout = bounded_timeout_seconds(args.get("timeout", 8), 8.0)
 
     if reuse_existing:
         try:
@@ -4234,10 +4297,8 @@ def semantic_set_value(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def semantic_wait(args: dict[str, Any]) -> dict[str, Any]:
-    duration = args.get("duration", 1)
-    if not isinstance(duration, (int, float)):
-        raise RuntimeError("wait requires numeric duration")
-    time.sleep(max(0.0, min(float(duration), 30.0)))
+    duration = bounded_timeout_seconds(args.get("duration", 1), 1.0)
+    time.sleep(duration)
     return result_text({"ok": True, "duration": duration})
 
 
@@ -4269,10 +4330,8 @@ def wait_window_candidates(args: dict[str, Any]) -> list[dict[str, Any]]:
 def semantic_wait_for_window(args: dict[str, Any]) -> dict[str, Any]:
     if not any(isinstance(args.get(key), str) and args.get(key) for key in ("app", "related_to", "title", "class")):
         raise RuntimeError("wait_for_window requires app, related_to, title, or class")
-    timeout = args.get("timeout", 5)
-    if not isinstance(timeout, (int, float)):
-        timeout = 5
-    deadline = time.monotonic() + max(0.0, min(float(timeout), 30.0))
+    timeout = bounded_timeout_seconds(args.get("timeout", 5), 5.0)
+    deadline = time.monotonic() + timeout
     last_error = ""
     while True:
         try:
@@ -4317,10 +4376,8 @@ def semantic_wait_for_close(args: dict[str, Any]) -> dict[str, Any]:
     target = args.get("target") or args.get("app")
     if not isinstance(target, str) or not target:
         raise RuntimeError("wait_for_close requires target or app")
-    timeout = args.get("timeout", 5)
-    if not isinstance(timeout, (int, float)):
-        timeout = 5
-    deadline = time.monotonic() + max(0.0, min(float(timeout), 30.0))
+    timeout = bounded_timeout_seconds(args.get("timeout", 5), 5.0)
+    deadline = time.monotonic() + timeout
     while True:
         if not target_exists(target):
             related_to = args.get("related_to")
@@ -4696,10 +4753,8 @@ def computer(args: dict[str, Any]) -> dict[str, Any]:
         return result_text(paste(target, args, set_clipboard_bytes(path.read_bytes(), mime)))
 
     if action == "wait":
-        duration = args.get("duration", 1)
-        if not isinstance(duration, (int, float)):
-            raise RuntimeError("wait requires numeric duration")
-        time.sleep(max(0.0, min(float(duration), 30.0)))
+        duration = bounded_timeout_seconds(args.get("duration", 1), 1.0)
+        time.sleep(duration)
         return result_text({"ok": True, "duration": duration})
 
     if action == "doctor":

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib.util
+import math
 import pathlib
 
 
@@ -35,6 +36,11 @@ class DummyActionNode:
 
 def main() -> int:
     mcp = load_mcp()
+    assert mcp.bounded_timeout_seconds(30000, 8.0) == 30.0
+    assert mcp.bounded_timeout_seconds(-1, 8.0) == 0.0
+    assert mcp.bounded_timeout_seconds(True, 8.0) == 8.0
+    assert mcp.bounded_timeout_seconds(math.nan, 8.0) == 8.0
+    assert mcp.bounded_timeout_seconds(math.inf, 8.0) == 8.0
     window = {"at": [1772, 2108], "size": [1416, 828]}
     screenshot = {
         "width": 2862,
@@ -391,6 +397,8 @@ def main() -> int:
     assert mcp.snapshot_has_grid_target({"elements": [{"controlType": "table cell"}]}) is True
 
     original_list_hypr_windows = mcp.list_hypr_windows
+    original_monotonic = mcp.time.monotonic
+    original_sleep = mcp.time.sleep
     try:
         existing_window = {"address": "0xold", "class": "chromium", "title": "Old Chromium"}
         mcp.list_hypr_windows = lambda: [existing_window]
@@ -406,8 +414,49 @@ def main() -> int:
         selected, selected_new = mcp.wait_for_launch_window({"address:0xold"}, "chromium", 0.0, allow_existing_fallback=False)
         assert selected is unrelated_new
         assert selected_new == [unrelated_new]
+
+        monotonic_values = iter([0.0, 0.0, 1.1])
+        mcp.time.monotonic = lambda: next(monotonic_values)
+        mcp.time.sleep = lambda duration: None
+        selected, selected_new = mcp.wait_for_launch_window({"address:0xold"}, "chromium", 30.0, allow_existing_fallback=False)
+        assert selected is unrelated_new
+        assert selected_new == [unrelated_new]
     finally:
         mcp.list_hypr_windows = original_list_hypr_windows
+        mcp.time.monotonic = original_monotonic
+        mcp.time.sleep = original_sleep
+
+    original_launch_parts = mcp.launch_parts
+    original_list_hypr_windows = mcp.list_hypr_windows
+    original_hyprctl_exec = mcp.hyprctl_exec
+    original_wait_for_launch_window = mcp.wait_for_launch_window
+    launch_timeouts = []
+    try:
+        mcp.launch_parts = lambda args: (["fake-app"], "fake-app")
+        mcp.list_hypr_windows = lambda: []
+        mcp.hyprctl_exec = lambda command: "ok"
+
+        def capture_launch_timeout(before_ids, query, timeout, *, allow_existing_fallback=True):
+            launch_timeouts.append(timeout)
+            return None, []
+
+        mcp.wait_for_launch_window = capture_launch_timeout
+        mcp.tool_launch_app({"app": "fake-app", "reuse_existing": False, "timeout": 30000})
+        assert launch_timeouts == [mcp.MAX_TOOL_WAIT_SECONDS]
+    finally:
+        mcp.launch_parts = original_launch_parts
+        mcp.list_hypr_windows = original_list_hypr_windows
+        mcp.hyprctl_exec = original_hyprctl_exec
+        mcp.wait_for_launch_window = original_wait_for_launch_window
+
+    original_busctl_user = mcp.busctl_user
+    busctl_timeouts = []
+    try:
+        mcp.busctl_user = lambda args, timeout=2.0: (busctl_timeouts.append(timeout) or False, "")
+        assert mcp.dbus_tree_paths(":1.234") == []
+        assert busctl_timeouts == [mcp.GLOBAL_MENU_TREE_TIMEOUT_SECONDS]
+    finally:
+        mcp.busctl_user = original_busctl_user
     return 0
 
 

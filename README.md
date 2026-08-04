@@ -35,7 +35,9 @@ The screenshot dispatcher renders active monitor workspaces into RGBA artifacts 
 
 For XWayland windows, the dispatcher sends to the `wlSurface()` resource and scales surface-local coordinates by `m_X11SurfaceScaledBy`. If the requested global coordinate lands on a same-process XWayland helper window, such as a search popup, pointer and keyboard dispatch are automatically routed to that related window. For native Wayland windows, it resolves subsurfaces through the root `CWLSurfaceResource::at()` traversal so they receive surface-local coordinates.
 
-The keyboard dispatcher temporarily focuses the target surface, sends key events and modifier state through `g_pSeatManager`, then restores the previous keyboard focus. The MCP layer uses that for shortcuts and text/file/image paste flows.
+The keyboard dispatcher sends a transactional enter/key/leave sequence directly to the target client's `CWLKeyboardResource`; it does not change `g_pSeatManager`'s global keyboard focus. If the human and agent targets belong to the same Wayland client, the previous surface, held keys, and modifier state are restored synchronously before the dispatcher returns. Native clipboard paste also sends the current selection offer directly to the target data device before Ctrl+V.
+
+XWayland applications share one X input focus, so they use a short compatibility lease instead of the fully isolated native path. Repeated agent keys extend that lease, while any real compositor keyboard event restores the previous X focus before the physical key is delivered. The MCP text path first uses AT-SPI when the target snapshot identifies a focused editable control, then falls back to the resource-level key or clipboard lanes.
 
 For apps that spawn visible helper windows or dialogs during background control, `hypr-agent-protal:session begin,<target>` records the target window workspace. New same-process related windows opened during the session are moved back to that workspace instead of appearing on the agent's current workspace. Paste actions begin and sync this session automatically; if a paste opens a related dialog, the MCP result and the next `get_app_state` output include the dialog's `address:0x...` target so the agent can operate that dialog before returning to the root window.
 
@@ -293,8 +295,8 @@ plugin {
     allow_session = 1
     show_indicator = 1
     indicator_timeout_ms = 30000
-    # Keep keyboard focus briefly after modified shortcuts such as Ctrl+V so
-    # clients can finish asynchronous clipboard reads before focus is restored.
+    # XWayland-only upper bound for a modified shortcut lease. Physical keyboard
+    # input preempts the lease immediately; native Wayland never uses this delay.
     keyboard_restore_delay_ms = 700
     # cursor_texture_path = ~/.config/hypr-agent-protal/codex-cursor-252.abgr
   }

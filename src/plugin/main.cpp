@@ -14,15 +14,19 @@
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
+#include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
+#include <hyprland/src/protocols/core/DataDevice.hpp>
+#include <hyprland/src/protocols/core/Seat.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/Texture.hpp>
 #include <hyprland/src/render/gl/GLTexture.hpp>
 #include <hyprland/src/render/pass/TexPassElement.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/xwayland/XSurface.hpp>
+#include <hyprland/src/xwayland/XWayland.hpp>
 #undef private
 
 extern "C" {
@@ -62,13 +66,16 @@ namespace {
 using Render::GL::g_pHyprOpenGL;
 
 std::vector<SP<CEventLoopTimer>> g_pointerRestoreTimers;
-std::vector<SP<CEventLoopTimer>> g_keyboardRestoreTimers;
 std::vector<SP<CEventLoopTimer>> g_workspaceRestackTimers;
 SP<CEventLoopTimer>              g_indicatorHideTimer;
 SP<CEventLoopTimer>              g_indicatorAnimationTimer;
+SP<CEventLoopTimer>              g_xwaylandKeyboardRestoreTimer;
 CHyprSignalListener              g_windowOpenListener;
 CHyprSignalListener              g_windowOpenEarlyListener;
 CHyprSignalListener              g_renderStageListener;
+CHyprSignalListener              g_keyboardInputListener;
+CHyprSignalListener              g_pointerButtonInputListener;
+CHyprSignalListener              g_pointerMotionInputListener;
 PHLWINDOWREF                     g_agentPointerWindow;
 std::optional<Vector2D>          g_agentPointerPosition;
 std::optional<Vector2D>          g_agentPointerStartPosition;
@@ -212,7 +219,7 @@ void registerPluginConfig() {
     g_config.showIndicator         = makeShared<CBoolValue>(LUA_CONFIG_SHOW_INDICATOR, "show the visible agent cursor indicator", true);
     g_config.indicatorTimeoutMs    = makeShared<CIntValue>(LUA_CONFIG_INDICATOR_TIMEOUT_MS, "visible agent cursor timeout in milliseconds", Config::INTEGER{30000});
     g_config.keyboardRestoreDelayMs = makeShared<CIntValue>(LUA_CONFIG_KEYBOARD_RESTORE_DELAY_MS,
-                                                            "delay before restoring keyboard focus after modified shortcuts", Config::INTEGER{700});
+                                                            "maximum XWayland keyboard lease after modified shortcuts", Config::INTEGER{700});
     g_config.cursorTexturePath =
         makeShared<CStringValue>(LUA_CONFIG_CURSOR_TEXTURE_PATH, "raw ABGR cursor texture path", Config::STRING{""});
 
@@ -313,7 +320,7 @@ Time::steady_dur indicatorTimeout() {
     return std::chrono::milliseconds(indicatorTimeoutMs());
 }
 
-int keyboardRestoreDelayMs() {
+int xwaylandKeyboardRestoreDelayMs() {
     return std::clamp(configInt("keyboard_restore_delay_ms", 700), 0, 5000);
 }
 
@@ -1113,15 +1120,6 @@ void removePointerTimer(const SP<CEventLoopTimer>& self) {
         g_pointerRestoreTimers.end());
 }
 
-void removeKeyboardTimer(const SP<CEventLoopTimer>& self) {
-    if (g_pEventLoopManager)
-        g_pEventLoopManager->removeTimer(self);
-
-    g_keyboardRestoreTimers.erase(
-        std::remove_if(g_keyboardRestoreTimers.begin(), g_keyboardRestoreTimers.end(), [&self](const auto& item) { return item.get() == self.get(); }),
-        g_keyboardRestoreTimers.end());
-}
-
 struct TargetSurface {
     PHLWINDOW              window;
     SP<CWLSurfaceResource> surface;
@@ -1485,62 +1483,265 @@ struct PointerFocusRestore {
     PointerFocusRestore& operator=(const PointerFocusRestore&) = delete;
 };
 
-struct KeyboardFocusRestore {
-    SP<CWLSurfaceResource> previousSurface;
-    bool                   restored = false;
-
-    KeyboardFocusRestore() {
-        if (!g_pSeatManager)
-            return;
-        previousSurface = g_pSeatManager->m_state.keyboardFocus.lock();
-    }
-
-    ~KeyboardFocusRestore() {
-        restoreNow();
-    }
-
-    void restoreNow() {
-        if (restored || !g_pSeatManager)
-            return;
-        restored = true;
-        g_pSeatManager->sendKeyboardMods(0, 0, 0, 0);
-        g_pSeatManager->setKeyboardFocus(previousSurface);
-    }
-
-    void restoreLater(std::chrono::milliseconds delay) {
-        if (restored)
-            return;
-        if (!g_pEventLoopManager || delay.count() <= 0) {
-            restoreNow();
-            return;
-        }
-
-        auto previous = previousSurface;
-        auto timer = makeShared<CEventLoopTimer>(
-            delay,
-            [previous](SP<CEventLoopTimer> self, void*) {
-                if (g_pSeatManager) {
-                    g_pSeatManager->sendKeyboardMods(0, 0, 0, 0);
-                    g_pSeatManager->setKeyboardFocus(previous);
-                }
-                removeKeyboardTimer(self);
-            },
-            nullptr);
-
-        restored = true;
-        g_keyboardRestoreTimers.push_back(timer);
-        g_pEventLoopManager->addTimer(timer);
-    }
-
-    KeyboardFocusRestore(const KeyboardFocusRestore&) = delete;
-    KeyboardFocusRestore& operator=(const KeyboardFocusRestore&) = delete;
+struct KeyboardStateSnapshot {
+    std::vector<uint32_t> pressedKeys;
+    uint32_t              depressed = 0;
+    uint32_t              latched   = 0;
+    uint32_t              locked    = 0;
+    uint32_t              group     = 0;
 };
 
-void activateXWaylandTarget(const TargetSurface& target) {
-    if (!target.window || !target.window->m_isX11 || !target.window->m_xwaylandSurface)
+KeyboardStateSnapshot physicalKeyboardState() {
+    KeyboardStateSnapshot state;
+    if (g_pInputManager)
+        state.pressedKeys = g_pInputManager->getKeysFromAllKBs();
+
+    const auto activeKeyboard = g_pSeatManager ? g_pSeatManager->m_keyboard.lock() : nullptr;
+    if (!activeKeyboard)
+        return state;
+
+    state.depressed = activeKeyboard->m_modifiersState.depressed;
+    state.latched   = activeKeyboard->m_modifiersState.latched;
+    state.locked    = activeKeyboard->m_modifiersState.locked;
+    state.group     = activeKeyboard->m_modifiersState.group;
+
+    if (!g_pInputManager)
+        return state;
+
+    for (const auto& keyboard : g_pInputManager->m_keyboards) {
+        if (!keyboard || !keyboard->m_enabled || !keyboard->shareStates() ||
+            (keyboard->isVirtual() && g_pInputManager->shouldIgnoreVirtualKeyboard(keyboard)))
+            continue;
+        state.depressed |= keyboard->m_modifiersState.depressed;
+        state.latched |= keyboard->m_modifiersState.latched;
+        state.locked |= keyboard->m_modifiersState.locked;
+    }
+    return state;
+}
+
+void fillPressedKeysArray(wl_array& keys, const std::vector<uint32_t>& pressedKeys) {
+    wl_array_init(&keys);
+    if (pressedKeys.empty())
         return;
 
-    target.window->m_xwaylandSurface->activate(true);
+    const auto byteCount = pressedKeys.size() * sizeof(uint32_t);
+    if (auto* storage = static_cast<uint32_t*>(wl_array_add(&keys, byteCount)); storage)
+        std::copy(pressedKeys.begin(), pressedKeys.end(), storage);
+}
+
+// A target client may temporarily see a keyboard enter/key/leave sequence, but the
+// compositor's global keyboard focus and every other Wayland client remain untouched.
+class KeyboardResourceTransaction {
+  public:
+    explicit KeyboardResourceTransaction(SP<CWLSurfaceResource> target) : m_target(std::move(target)), m_physicalState(physicalKeyboardState()) {
+        if (!m_target || !PROTO::seat)
+            return;
+
+        wl_array emptyKeys;
+        wl_array_init(&emptyKeys);
+        for (const auto& keyboard : PROTO::seat->m_keyboards) {
+            if (!keyboard)
+                continue;
+            const auto owner = keyboard->m_owner.lock();
+            if (!owner || owner->client() != m_target->client())
+                continue;
+
+            const auto previousSurface = keyboard->m_currentSurface.lock();
+            if (previousSurface != m_target)
+                keyboard->sendEnter(m_target, &emptyKeys);
+            if (keyboard->m_currentSurface.lock() == m_target)
+                m_endpoints.push_back({.keyboard = keyboard, .previousSurface = previousSurface});
+        }
+        wl_array_release(&emptyKeys);
+    }
+
+    ~KeyboardResourceTransaction() {
+        restore();
+    }
+
+    bool ready() const {
+        return !m_endpoints.empty();
+    }
+
+    void sendKey(uint32_t key, wl_keyboard_key_state state) {
+        const auto timestamp = nowMs();
+        for (const auto& endpoint : m_endpoints)
+            endpoint.keyboard->sendKey(timestamp, key, state);
+    }
+
+    void sendModifierKey(uint32_t key, wl_keyboard_key_state state) {
+        const auto timestamp = nowMs();
+        for (const auto& endpoint : m_endpoints) {
+            if (endpoint.previousSurface == m_target && physicalKeyHeld(key))
+                continue;
+            endpoint.keyboard->sendKey(timestamp, key, state);
+        }
+    }
+
+    bool targetKeyConflictsWithPhysicalInput(uint32_t key) const {
+        if (!physicalKeyHeld(key))
+            return false;
+        return std::any_of(m_endpoints.begin(), m_endpoints.end(), [this](const auto& endpoint) { return endpoint.previousSurface == m_target; });
+    }
+
+    void sendMods(uint32_t depressed, uint32_t latched = 0, uint32_t locked = 0, uint32_t group = 0) {
+        for (const auto& endpoint : m_endpoints)
+            endpoint.keyboard->sendMods(depressed, latched, locked, group);
+    }
+
+    void flushTargetClient() const {
+        if (m_target && m_target->client())
+            wl_client_flush(m_target->client());
+    }
+
+    KeyboardResourceTransaction(const KeyboardResourceTransaction&) = delete;
+    KeyboardResourceTransaction& operator=(const KeyboardResourceTransaction&) = delete;
+
+  private:
+    struct Endpoint {
+        SP<CWLKeyboardResource> keyboard;
+        SP<CWLSurfaceResource>  previousSurface;
+    };
+
+    bool physicalKeyHeld(uint32_t key) const {
+        return std::find(m_physicalState.pressedKeys.begin(), m_physicalState.pressedKeys.end(), key) != m_physicalState.pressedKeys.end();
+    }
+
+    void restore() {
+        if (m_restored)
+            return;
+        m_restored = true;
+
+        wl_array pressedKeys;
+        fillPressedKeysArray(pressedKeys, m_physicalState.pressedKeys);
+        for (const auto& endpoint : m_endpoints) {
+            if (endpoint.previousSurface != m_target) {
+                if (endpoint.keyboard->m_currentSurface.lock() == m_target)
+                    endpoint.keyboard->sendLeave();
+                if (endpoint.previousSurface) {
+                    endpoint.keyboard->sendEnter(endpoint.previousSurface, &pressedKeys);
+                    endpoint.keyboard->sendMods(m_physicalState.depressed, m_physicalState.latched, m_physicalState.locked, m_physicalState.group);
+                }
+            } else {
+                endpoint.keyboard->sendMods(m_physicalState.depressed, m_physicalState.latched, m_physicalState.locked, m_physicalState.group);
+            }
+        }
+        wl_array_release(&pressedKeys);
+        flushTargetClient();
+    }
+
+    SP<CWLSurfaceResource> m_target;
+    KeyboardStateSnapshot  m_physicalState;
+    std::vector<Endpoint>  m_endpoints;
+    bool                   m_restored = false;
+};
+
+struct XWaylandKeyboardLease {
+    WP<CXWaylandSurface> previous;
+    WP<CXWaylandSurface> target;
+    bool                 active = false;
+};
+
+XWaylandKeyboardLease g_xwaylandKeyboardLease;
+
+void cancelXWaylandKeyboardRestoreTimer() {
+    if (g_xwaylandKeyboardRestoreTimer && g_pEventLoopManager)
+        g_pEventLoopManager->removeTimer(g_xwaylandKeyboardRestoreTimer);
+    g_xwaylandKeyboardRestoreTimer.reset();
+}
+
+void syncXWaylandFocus() {
+    if (!g_pXWayland || !g_pXWayland->m_wm)
+        return;
+    auto* connection = g_pXWayland->m_wm->getConnection();
+    if (!connection)
+        return;
+
+    xcb_generic_error_t* error = nullptr;
+    auto* reply = xcb_get_input_focus_reply(connection, xcb_get_input_focus(connection), &error);
+    std::free(reply);
+    std::free(error);
+}
+
+void restoreXWaylandKeyboardFocus() {
+    cancelXWaylandKeyboardRestoreTimer();
+    if (!g_xwaylandKeyboardLease.active)
+        return;
+
+    const auto previous = g_xwaylandKeyboardLease.previous.lock();
+    const auto target   = g_xwaylandKeyboardLease.target.lock();
+    g_xwaylandKeyboardLease = {};
+
+    if (!g_pXWayland || !g_pXWayland->m_wm || !target)
+        return;
+    if (previous)
+        previous->activate(true);
+    else
+        target->activate(false);
+    syncXWaylandFocus();
+}
+
+bool activateXWaylandKeyboardTarget(const TargetSurface& target) {
+    if (!target.window || !target.window->m_isX11 || !target.window->m_xwaylandSurface || !g_pXWayland || !g_pXWayland->m_wm)
+        return false;
+
+    const auto xTarget = target.window->m_xwaylandSurface;
+    if (g_xwaylandKeyboardLease.active) {
+        cancelXWaylandKeyboardRestoreTimer();
+        if (g_pXWayland->m_wm->m_focusedSurface.lock() != xTarget) {
+            xTarget->activate(true);
+            syncXWaylandFocus();
+            if (g_pXWayland->m_wm->m_focusedSurface.lock() != xTarget) {
+                restoreXWaylandKeyboardFocus();
+                return false;
+            }
+            g_xwaylandKeyboardLease.target = xTarget;
+        }
+        return true;
+    }
+
+    const auto previous = g_pXWayland->m_wm->m_focusedSurface.lock();
+    if (previous == xTarget)
+        return false;
+
+    xTarget->activate(true);
+    syncXWaylandFocus();
+    if (g_pXWayland->m_wm->m_focusedSurface.lock() != xTarget)
+        return false;
+
+    g_xwaylandKeyboardLease = {.previous = previous, .target = xTarget, .active = true};
+    return true;
+}
+
+void restoreXWaylandKeyboardFocusLater(std::chrono::milliseconds delay) {
+    if (!g_xwaylandKeyboardLease.active)
+        return;
+    if (!g_pEventLoopManager || delay.count() <= 0) {
+        restoreXWaylandKeyboardFocus();
+        return;
+    }
+
+    cancelXWaylandKeyboardRestoreTimer();
+    g_xwaylandKeyboardRestoreTimer = makeShared<CEventLoopTimer>(
+        delay,
+        [](SP<CEventLoopTimer>, void*) { restoreXWaylandKeyboardFocus(); },
+        nullptr);
+    g_pEventLoopManager->addTimer(g_xwaylandKeyboardRestoreTimer);
+}
+
+void sendClipboardSelectionToNativeTarget(const TargetSurface& target) {
+    if (!target.surface || (target.window && target.window->m_isX11) || !PROTO::data || !g_pSeatManager)
+        return;
+
+    const auto selection = g_pSeatManager->m_selection.currentSelection.lock();
+    const auto device    = PROTO::data->dataDeviceForClient(target.surface->client());
+    if (selection && device)
+        PROTO::data->sendSelectionToDevice(device, selection);
+}
+
+void activateXWaylandTarget(const TargetSurface& target) {
+    if (activateXWaylandKeyboardTarget(target))
+        restoreXWaylandKeyboardFocusLater(std::chrono::milliseconds(1000));
 }
 
 void sendPointerScroll(double dx, double dy) {
@@ -1890,46 +2091,67 @@ SDispatchResult dispatchKeyboard(const std::string& args) {
         }
     }
 
-    KeyboardFocusRestore restore;
-    activateXWaylandTarget(*target);
+    const bool xwaylandLease = activateXWaylandKeyboardTarget(*target);
     showAgentIndicator(target->window, indicatorGlobal.value_or(windowMainSurfaceGoalBox(target->window).middle()), "key");
-    g_pSeatManager->setKeyboardFocus(target->surface);
+
+    KeyboardResourceTransaction transaction(target->surface);
+    if (!transaction.ready()) {
+        if (xwaylandLease)
+            restoreXWaylandKeyboardFocus();
+        return {.success = false, .error = "target client has no keyboard resource"};
+    }
+    if (transaction.targetKeyConflictsWithPhysicalInput(*key)) {
+        if (xwaylandLease)
+            restoreXWaylandKeyboardFocus();
+        return {.success = false, .error = "target key is currently held by the physical keyboard"};
+    }
+
+    if (*key == KEY_V && (modifierMask & (1U << 2)) != 0)
+        sendClipboardSelectionToNativeTarget(*target);
 
     const auto pressModifiers = [&] {
         for (const auto& mod : modifiers)
-            g_pSeatManager->sendKeyboardKey(nowMs(), mod.key, WL_KEYBOARD_KEY_STATE_PRESSED);
-        if (modifierMask != 0)
-            g_pSeatManager->sendKeyboardMods(modifierMask, 0, 0, 0);
+            transaction.sendModifierKey(mod.key, WL_KEYBOARD_KEY_STATE_PRESSED);
+        transaction.sendMods(modifierMask, 0, 0, 0);
     };
 
     const auto releaseModifiers = [&] {
-        if (modifierMask != 0)
-            g_pSeatManager->sendKeyboardMods(0, 0, 0, 0);
+        transaction.sendMods(0, 0, 0, 0);
         for (auto it = modifiers.rbegin(); it != modifiers.rend(); ++it)
-            g_pSeatManager->sendKeyboardKey(nowMs(), it->key, WL_KEYBOARD_KEY_STATE_RELEASED);
+            transaction.sendModifierKey(it->key, WL_KEYBOARD_KEY_STATE_RELEASED);
     };
 
     if (action == "tap" || action == "press-release") {
         pressModifiers();
-        g_pSeatManager->sendKeyboardKey(nowMs(), *key, WL_KEYBOARD_KEY_STATE_PRESSED);
-        g_pSeatManager->sendKeyboardKey(nowMs(), *key, WL_KEYBOARD_KEY_STATE_RELEASED);
+        transaction.sendKey(*key, WL_KEYBOARD_KEY_STATE_PRESSED);
+        transaction.sendKey(*key, WL_KEYBOARD_KEY_STATE_RELEASED);
         releaseModifiers();
-        restore.restoreLater(std::chrono::milliseconds(modifierMask != 0 ? keyboardRestoreDelayMs() : 90));
+        transaction.flushTargetClient();
+        if (xwaylandLease)
+            restoreXWaylandKeyboardFocusLater(std::chrono::milliseconds(modifierMask != 0 ? xwaylandKeyboardRestoreDelayMs() : 90));
         return {.success = true};
     }
 
     if (action == "press" || action == "down") {
         pressModifiers();
-        g_pSeatManager->sendKeyboardKey(nowMs(), *key, WL_KEYBOARD_KEY_STATE_PRESSED);
+        transaction.sendKey(*key, WL_KEYBOARD_KEY_STATE_PRESSED);
+        transaction.flushTargetClient();
+        if (xwaylandLease)
+            restoreXWaylandKeyboardFocusLater(std::chrono::milliseconds(90));
         return {.success = true};
     }
 
     if (action == "release" || action == "up") {
-        g_pSeatManager->sendKeyboardKey(nowMs(), *key, WL_KEYBOARD_KEY_STATE_RELEASED);
+        transaction.sendKey(*key, WL_KEYBOARD_KEY_STATE_RELEASED);
         releaseModifiers();
+        transaction.flushTargetClient();
+        if (xwaylandLease)
+            restoreXWaylandKeyboardFocusLater(std::chrono::milliseconds(90));
         return {.success = true};
     }
 
+    if (xwaylandLease)
+        restoreXWaylandKeyboardFocus();
     return {.success = false, .error = "unknown keyboard action"};
 }
 
@@ -2127,6 +2349,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_windowOpenEarlyListener = Event::bus()->m_events.window.openEarly.listen([](PHLWINDOW window) { handleWorkspaceSessionWindowOpenEarly(window); });
     g_windowOpenListener = Event::bus()->m_events.window.open.listen([](PHLWINDOW window) { handleWorkspaceSessionWindowOpen(window); });
     g_renderStageListener = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) { renderAgentIndicator(stage); });
+    g_keyboardInputListener = Event::bus()->m_events.input.keyboard.key.listen(
+        [](const IKeyboard::SKeyEvent&, Event::SCallbackInfo&) { restoreXWaylandKeyboardFocus(); });
+    g_pointerButtonInputListener = Event::bus()->m_events.input.mouse.button.listen(
+        [](const IPointer::SButtonEvent&, Event::SCallbackInfo&) { restoreXWaylandKeyboardFocus(); });
+    g_pointerMotionInputListener = Event::bus()->m_events.input.mouse.move.listen(
+        [](const Vector2D&, Event::SCallbackInfo&) { restoreXWaylandKeyboardFocus(); });
     HyprlandAPI::reloadConfig();
 
     return {
@@ -2142,11 +2370,13 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_windowOpenEarlyListener.reset();
     g_windowOpenListener.reset();
     g_renderStageListener.reset();
+    g_keyboardInputListener.reset();
+    g_pointerButtonInputListener.reset();
+    g_pointerMotionInputListener.reset();
+    restoreXWaylandKeyboardFocus();
 
     if (g_pEventLoopManager) {
         for (const auto& timer : g_pointerRestoreTimers)
-            g_pEventLoopManager->removeTimer(timer);
-        for (const auto& timer : g_keyboardRestoreTimers)
             g_pEventLoopManager->removeTimer(timer);
         for (const auto& timer : g_workspaceRestackTimers)
             g_pEventLoopManager->removeTimer(timer);
@@ -2156,7 +2386,6 @@ APICALL EXPORT void PLUGIN_EXIT() {
             g_pEventLoopManager->removeTimer(g_indicatorAnimationTimer);
     }
     g_pointerRestoreTimers.clear();
-    g_keyboardRestoreTimers.clear();
     g_workspaceRestackTimers.clear();
     g_indicatorHideTimer.reset();
     g_indicatorAnimationTimer.reset();

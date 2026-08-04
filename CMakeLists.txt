@@ -127,6 +127,7 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
       ${CMAKE_SOURCE_DIR}/mcp/hypr-agent-protal-mcp.py
       ${CMAKE_SOURCE_DIR}/tests/mcp_smoke.py
       ${CMAKE_SOURCE_DIR}/tests/mcp_geometry.py
+      ${CMAKE_SOURCE_DIR}/tests/keyboard_routing.py
       ${CMAKE_SOURCE_DIR}/tests/cursor_render.py
   )
   add_test(
@@ -140,5 +141,9 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
   add_test(
     NAME hypr-agent-protal-mcp-geometry
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mcp_geometry.py
+  )
+  add_test(
+    NAME hypr-agent-protal-keyboard-routing
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/keyboard_routing.py
   )
 endif()

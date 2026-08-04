@@ -503,7 +503,7 @@ def tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "type_text",
-            "description": "Type literal text into the target app. Use paste_text for multiline, tabular, CSV/TSV, Unicode-heavy, or long text. method=auto uses background key/paste input; method=atspi explicitly requests accessibility text insertion.",
+            "description": "Type literal text into the target app. Use paste_text for multiline, tabular, CSV/TSV, Unicode-heavy, or long text. method=auto prefers a focused AT-SPI editable control, then uses isolated background key/paste input; method=atspi explicitly requests accessibility text insertion.",
             "annotations": ACTION_ANNOTATIONS,
             "inputSchema": object_schema(
                 {
@@ -2480,6 +2480,8 @@ def atspi_record_for(
         "nativeWindowHandle": 0,
         "frame": atspi_image_frame(node, bounds, atspi_window_bounds, screenshot, hypr_window),
         "actions": atspi_action_names(node),
+        "focused": atspi_state_contains(node, _ATSPI.StateType.FOCUSED),
+        "editable": bool(atspi_safe(node.is_editable_text, False)) and bool(atspi_safe(node.is_text, False)),
         "source": "atspi",
     }
 
@@ -2669,14 +2671,16 @@ def atspi_find_first(root: Any, predicate: Any) -> Any:
     return None
 
 
-def atspi_insert_text(snapshot: dict[str, Any], text: str) -> bool:
+def atspi_insert_text(snapshot: dict[str, Any], text: str, *, focused_only: bool = False) -> bool:
     resolved = atspi_resolve_window(snapshot.get("window") or {})
     if not resolved:
         return False
     _, _, window_node = resolved
 
     def editable(node: Any) -> bool:
-        return bool(atspi_safe(node.is_editable_text, False)) and bool(atspi_safe(node.is_text, False))
+        if not bool(atspi_safe(node.is_editable_text, False)) or not bool(atspi_safe(node.is_text, False)):
+            return False
+        return not focused_only or atspi_state_contains(node, _ATSPI.StateType.FOCUSED)
 
     node = atspi_find_first(window_node, editable)
     if node is None:
@@ -2685,7 +2689,10 @@ def atspi_insert_text(snapshot: dict[str, Any], text: str) -> bool:
     text_iface = atspi_safe(node.get_text_iface)
     if editable_iface is None or text_iface is None:
         return False
-    offset = int(atspi_safe(lambda: _ATSPI.Text.get_character_count(text_iface), 0) or 0)
+    character_count = int(atspi_safe(lambda: _ATSPI.Text.get_character_count(text_iface), 0) or 0)
+    offset = int(atspi_safe(lambda: _ATSPI.Text.get_caret_offset(text_iface), character_count))
+    if offset < 0 or offset > character_count:
+        offset = character_count
     return bool(atspi_safe(lambda: _ATSPI.EditableText.insert_text(editable_iface, offset, text, len(text)), False))
 
 
@@ -3017,6 +3024,11 @@ def atspi_insert_text_isolated(snapshot: dict[str, Any], text: str) -> bool:
     return bool(result.get("ok"))
 
 
+def atspi_insert_focused_text_isolated(snapshot: dict[str, Any], text: str) -> bool:
+    result = atspi_child_action("insert_focused_text", snapshot.get("window") or {}, text=text)
+    return bool(result.get("ok"))
+
+
 def atspi_set_element_value_isolated(snapshot: dict[str, Any], element: dict[str, Any], value: str) -> bool:
     result = atspi_child_action("set_value", snapshot.get("window") or {}, runtime_id=element.get("runtimeId"), value=value)
     return bool(result.get("ok"))
@@ -3038,11 +3050,11 @@ def atspi_child_action_payload(payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "status": "unavailable", "error": init_error}
     window = payload.get("window") if isinstance(payload.get("window"), dict) else {}
     operation = str(payload.get("operation") or "")
-    if operation == "insert_text":
+    if operation in {"insert_text", "insert_focused_text"}:
         text = payload.get("text")
         if not isinstance(text, str):
             return {"ok": False, "status": "error", "error": "insert_text requires text"}
-        return {"ok": atspi_insert_text({"window": window}, text), "status": "ok"}
+        return {"ok": atspi_insert_text({"window": window}, text, focused_only=operation == "insert_focused_text"), "status": "ok"}
 
     runtime_id = payload.get("runtimeId")
     if not isinstance(runtime_id, list):
@@ -4217,14 +4229,20 @@ def semantic_type_text(args: dict[str, Any]) -> dict[str, Any]:
     snapshot = current_snapshot(app)
     control_overlay(snapshot, action="type")
     method = args.get("method") if isinstance(args.get("method"), str) else "auto"
+    has_focused_editable = any(
+        isinstance(element, dict) and element.get("source") == "atspi" and element.get("focused") is True and element.get("editable") is True
+        for element in snapshot.get("elements") or []
+    )
+    if method == "auto" and not text_is_bulk_paste_candidate(text) and has_focused_editable and atspi_insert_focused_text_isolated(snapshot, text):
+        return mcp_snapshot_result(snapshot_after_action(app, snapshot, {"method": "atspi", "targeting": "focused-editable"}))
     if method == "atspi" and atspi_insert_text_isolated(snapshot, text):
-        return mcp_snapshot_result(snapshot_after_action(app, snapshot))
+        return mcp_snapshot_result(snapshot_after_action(app, snapshot, {"method": "atspi", "targeting": "editable"}))
     type_args = dict(args)
     if method == "atspi":
         type_args["method"] = "auto"
     prepare_grid_bulk_paste(snapshot, text)
-    type_text(str(snapshot["target"]), text, type_args)
-    return mcp_snapshot_result(snapshot_after_action(app, snapshot))
+    info = type_text(str(snapshot["target"]), text, type_args)
+    return mcp_snapshot_result(snapshot_after_action(app, snapshot, info))
 
 
 def semantic_paste_text(args: dict[str, Any]) -> dict[str, Any]:

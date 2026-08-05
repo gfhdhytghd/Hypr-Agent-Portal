@@ -1,6 +1,6 @@
 {
   "name": "hypr-agent-protal",
-  "version": "0.3.45",
+  "version": "0.3.47",
   "description": "hypr-agent-protal MCP only. Hyprland background screenshot, input, clipboard, browser/Chromium control, app-state, and visible agent cursor bridge. Do not use Browser MCP when the user explicitly asks for hypr-agent-protal. Do not use the obsolete hyprcum server.",
   "mcpServers": "./.mcp.json",
   "interface": {

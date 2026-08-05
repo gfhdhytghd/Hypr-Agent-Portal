@@ -17,7 +17,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SERVER_VERSION = "0.3.45"
+SERVER_VERSION = "0.3.47"
 SNAPSHOTS: dict[str, dict[str, Any]] = {}
 GLOBAL_MENU_LIMIT = 80
 GLOBAL_MENU_TREE_TIMEOUT_SECONDS = 0.2

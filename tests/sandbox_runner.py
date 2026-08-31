@@ -50,12 +50,27 @@ class SandboxRunnerTests(unittest.TestCase):
     def test_dry_run_does_not_create_explicit_session_directory(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
             session = Path(parent) / "session"
+            env = dict(os.environ)
+            env["PATH"] = "/nonexistent"
             result = self.run_runner(
-                "run", "--backend", "headless", "--dry-run", "--json", "--session-dir", str(session), "--", "/bin/true"
+                "run",
+                "--backend",
+                "headless",
+                "--dry-run",
+                "--json",
+                "--session-dir",
+                str(session),
+                "--",
+                "/bin/true",
+                env=env,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["command"], ["/bin/true"])
+            self.assertFalse(payload["ok"])
+            self.assertFalse(payload["diagnostics"]["ok"])
+            self.assertIsNone(payload["diagnostics"]["commands"]["Hyprland"])
+            self.assertIsNone(payload["diagnostics"]["commands"]["dbus-daemon"])
             self.assertFalse(session.exists())
 
     def test_cleanup_refuses_unmarked_directory(self) -> None:

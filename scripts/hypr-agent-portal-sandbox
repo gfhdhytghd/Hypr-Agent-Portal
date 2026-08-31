@@ -549,10 +549,11 @@ def run_session(args: argparse.Namespace) -> int:
         "command": args.command or None,
         "plugins": [str(Path(p).expanduser().resolve()) for p in args.plugin],
         "config": config,
+        "diagnostics": report,
     }
     if args.dry_run:
         emit(plan, json_output=args.json)
-        return 0 if report["ok"] else 1
+        return 0
 
     previous_signal_handlers = install_signal_handlers()
     try:

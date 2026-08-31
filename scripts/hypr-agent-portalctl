@@ -218,7 +218,14 @@ def _artifact_record(path: pathlib.Path, *, directory: bool = False) -> dict:
     required_mode = 0o700 if directory else 0o600
     if stat.S_IMODE(info.st_mode) != required_mode:
         raise RuntimeError(f"screenshot artifact has unsafe permissions (expected {required_mode:04o}): {path}")
-    return {"path": str(path), "device": int(info.st_dev), "inode": int(info.st_ino)}
+    return {
+        "path": str(path),
+        "device": int(info.st_dev),
+        "inode": int(info.st_ino),
+        "ctimeNs": int(info.st_ctime_ns),
+        "mtimeNs": int(info.st_mtime_ns),
+        "size": int(info.st_size),
+    }
 
 
 def _screenshot_provenance(root: pathlib.Path, session_path: pathlib.Path, png_path: pathlib.Path | None, session: dict) -> dict:
@@ -247,23 +254,46 @@ def _screenshot_provenance(root: pathlib.Path, session_path: pathlib.Path, png_p
 
 def cleanup_screenshot_provenance(provenance: dict) -> None:
     """Remove only inode-bound artifacts created for this screenshot request."""
+    valid_directories: dict[pathlib.Path, tuple[int, int]] = {}
+    for record in provenance.get("directories", []):
+        path = pathlib.Path(str(record.get("path") or ""))
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if (
+            stat.S_ISDIR(info.st_mode)
+            and not stat.S_ISLNK(info.st_mode)
+            and info.st_uid == os.getuid()
+            and (int(info.st_dev), int(info.st_ino), int(info.st_ctime_ns))
+            == (int(record.get("device", -1)), int(record.get("inode", -1)), int(record.get("ctimeNs", -1)))
+        ):
+            valid_directories[path] = (int(info.st_dev), int(info.st_ino))
+
     for record in provenance.get("files", []):
         path = pathlib.Path(str(record.get("path") or ""))
         try:
             info = os.lstat(path)
         except FileNotFoundError:
             continue
-        if (int(info.st_dev), int(info.st_ino)) != (int(record.get("device", -1)), int(record.get("inode", -1))):
+        if path.parent != pathlib.Path(str(provenance.get("root") or "")) and path.parent not in valid_directories:
+            continue
+        if (int(info.st_dev), int(info.st_ino), int(info.st_ctime_ns), int(info.st_mtime_ns), int(info.st_size)) != (
+            int(record.get("device", -1)),
+            int(record.get("inode", -1)),
+            int(record.get("ctimeNs", -1)),
+            int(record.get("mtimeNs", -1)),
+            int(record.get("size", -1)),
+        ):
             continue
         if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid():
             path.unlink()
-    for record in reversed(provenance.get("directories", [])):
-        path = pathlib.Path(str(record.get("path") or ""))
+    for path, expected_identity in reversed(list(valid_directories.items())):
         try:
             info = os.lstat(path)
         except FileNotFoundError:
             continue
-        if (int(info.st_dev), int(info.st_ino)) != (int(record.get("device", -1)), int(record.get("inode", -1))):
+        if (int(info.st_dev), int(info.st_ino)) != expected_identity:
             continue
         if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid():
             try:

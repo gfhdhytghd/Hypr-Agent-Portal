@@ -214,13 +214,40 @@ def main() -> int:
             artifact.write_bytes(b"raw")
             artifact.chmod(0o600)
             record = ctl._artifact_record(artifact)
-            dir_record = ctl._artifact_record(artifact_root, directory=True)
             artifact.unlink()
             artifact.write_bytes(b"replacement")
             artifact.chmod(0o600)
+            replacement_info = artifact.stat()
+            # Model an aggressive filesystem reusing the old inode immediately:
+            # dev+ino alone must not authorize deletion when ctime changed.
+            record["device"] = replacement_info.st_dev
+            record["inode"] = replacement_info.st_ino
+            record["ctimeNs"] = replacement_info.st_ctime_ns - 1
+            dir_record = ctl._artifact_record(artifact_root, directory=True)
             mcp.cleanup_screenshot_provenance({"root": str(private_root), "files": [record], "directories": [dir_record]})
             assert artifact.read_bytes() == b"replacement"
             assert artifact_root.exists()
+
+            ctl_artifact_root = private_root / "manual-ctl-artifact"
+            ctl_artifact_root.mkdir(mode=0o700)
+            ctl_artifact = ctl_artifact_root / "raw.rgba"
+            ctl_artifact.write_bytes(b"old")
+            ctl_artifact.chmod(0o600)
+            ctl_record = ctl._artifact_record(ctl_artifact)
+            ctl_artifact.unlink()
+            ctl_artifact.write_bytes(b"new")
+            ctl_artifact.chmod(0o600)
+            ctl_replacement = ctl_artifact.stat()
+            ctl_record["device"] = ctl_replacement.st_dev
+            ctl_record["inode"] = ctl_replacement.st_ino
+            ctl_record["ctimeNs"] = ctl_replacement.st_ctime_ns - 1
+            ctl.cleanup_screenshot_provenance({
+                "root": str(private_root),
+                "files": [ctl_record],
+                "directories": [ctl._artifact_record(ctl_artifact_root, directory=True)],
+            })
+            assert ctl_artifact.read_bytes() == b"new"
+            assert ctl_artifact_root.exists()
 
             exception_root = private_root / "exception-artifact"
             exception_root.mkdir(mode=0o700)

@@ -962,28 +962,8 @@ def cleanup_screenshot_provenance(provenance: Any) -> None:
     if root.name != f"hypr-agent-portal-{os.getuid()}":
         return
 
-    for record in provenance.get("files", []):
-        if not isinstance(record, dict):
-            continue
-        path_value = record.get("path")
-        if not isinstance(path_value, str) or not path_value:
-            continue
-        path = pathlib.Path(path_value)
-        if path.parent != root and path.parent.parent != root:
-            continue
-        try:
-            info = os.lstat(path)
-        except (FileNotFoundError, OSError):
-            continue
-        if (int(info.st_dev), int(info.st_ino)) != (int(record.get("device", -1)), int(record.get("inode", -1))):
-            continue
-        if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid():
-            try:
-                path.unlink()
-            except OSError:
-                pass
-
-    for record in reversed(provenance.get("directories", [])):
+    valid_directories: dict[pathlib.Path, tuple[int, int]] = {}
+    for record in provenance.get("directories", []):
         if not isinstance(record, dict):
             continue
         path_value = record.get("path")
@@ -996,7 +976,48 @@ def cleanup_screenshot_provenance(provenance: Any) -> None:
             info = os.lstat(path)
         except (FileNotFoundError, OSError):
             continue
-        if (int(info.st_dev), int(info.st_ino)) != (int(record.get("device", -1)), int(record.get("inode", -1))):
+        if (
+            stat.S_ISDIR(info.st_mode)
+            and not stat.S_ISLNK(info.st_mode)
+            and info.st_uid == os.getuid()
+            and (int(info.st_dev), int(info.st_ino), int(info.st_ctime_ns))
+            == (int(record.get("device", -1)), int(record.get("inode", -1)), int(record.get("ctimeNs", -1)))
+        ):
+            valid_directories[path] = (int(info.st_dev), int(info.st_ino))
+
+    for record in provenance.get("files", []):
+        if not isinstance(record, dict):
+            continue
+        path_value = record.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            continue
+        path = pathlib.Path(path_value)
+        if path.parent != root and path.parent not in valid_directories:
+            continue
+        try:
+            info = os.lstat(path)
+        except (FileNotFoundError, OSError):
+            continue
+        if (int(info.st_dev), int(info.st_ino), int(info.st_ctime_ns), int(info.st_mtime_ns), int(info.st_size)) != (
+            int(record.get("device", -1)),
+            int(record.get("inode", -1)),
+            int(record.get("ctimeNs", -1)),
+            int(record.get("mtimeNs", -1)),
+            int(record.get("size", -1)),
+        ):
+            continue
+        if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    for path, expected_identity in reversed(list(valid_directories.items())):
+        try:
+            info = os.lstat(path)
+        except (FileNotFoundError, OSError):
+            continue
+        if (int(info.st_dev), int(info.st_ino)) != expected_identity:
             continue
         if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid():
             try:
@@ -1091,8 +1112,11 @@ def hyprctl_environment() -> dict[str, str]:
     if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
         return env
 
-    proc = subprocess.run(["hyprctl", "instances", "-j"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, check=False)
-    if proc.returncode == 0 and proc.stdout.strip():
+    hyprctl = shutil.which("hyprctl", path=env.get("PATH"))
+    proc = None
+    if hyprctl:
+        proc = subprocess.run([hyprctl, "instances", "-j"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, check=False)
+    if proc is not None and proc.returncode == 0 and proc.stdout.strip():
         try:
             instances = json.loads(proc.stdout)
         except json.JSONDecodeError:
@@ -1137,7 +1161,10 @@ def lua_quote(value: str) -> str:
 
 
 def hyprland_config_provider() -> str | None:
-    proc = subprocess.run(["hyprctl", "systeminfo"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False)
+    hyprctl = shutil.which("hyprctl")
+    if not hyprctl:
+        return None
+    proc = subprocess.run([hyprctl, "systeminfo"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False)
     if proc.returncode != 0:
         return None
     match = re.search(r"^configProvider:\s*(\S+)", proc.stdout, re.MULTILINE)
@@ -2598,9 +2625,12 @@ def screenshot_for_window(window: dict[str, Any]) -> tuple[dict[str, Any], str]:
 
 
 def hyprctl_json(*args: str) -> Any:
+    hyprctl = shutil.which("hyprctl")
+    if not hyprctl:
+        raise RuntimeError("hyprctl is unavailable; a running Hyprland session and hyprctl in PATH are required for this action")
     try:
         proc = subprocess.run(
-            ["hyprctl", *args],
+            [hyprctl, *args],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

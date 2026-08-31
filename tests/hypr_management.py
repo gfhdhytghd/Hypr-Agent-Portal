@@ -496,16 +496,24 @@ class HyprManagementTests(unittest.TestCase):
 
         def fake_run(argv, **_kwargs):
             lua_calls.append(tuple(argv))
-            return __import__("subprocess").CompletedProcess(argv, 0, "ok", "")
+            stdout = "configProvider: lua\n" if "systeminfo" in argv else "ok"
+            return __import__("subprocess").CompletedProcess(argv, 0, stdout, "")
 
-        with mock.patch.object(portalctl, "is_lua_config_provider", return_value=True), mock.patch.object(
-            portalctl.subprocess, "run", side_effect=fake_run
-        ):
+        with mock.patch.object(portalctl.subprocess, "run", side_effect=fake_run):
             result = portalctl.dispatch("hypr-agent-portal:manage", payload)
         self.assertEqual(result.returncode, 0)
+        provider_probes = [call for call in lua_calls if call and call[0] == "hyprctl" and "systeminfo" in call]
+        self.assertEqual(len(provider_probes), 1, lua_calls)
+        lua_manage_calls = [
+            call
+            for call in lua_calls
+            if call[:2] == ("hyprctl", "dispatch")
+            and len(call) >= 3
+            and call[2].startswith("hl.plugin.hypr_agent_portal.manage(")
+        ]
         self.assertEqual(
-            lua_calls[0][2],
-            'hl.plugin.hypr_agent_portal.manage("focus,address:0xabc@pid=101@start=1001")',
+            lua_manage_calls,
+            [("hyprctl", "dispatch", 'hl.plugin.hypr_agent_portal.manage("focus,address:0xabc@pid=101@start=1001")')],
         )
         self.assertEqual(
             portalctl.lua_plugin_dispatcher("hypr-agent-protal:manage", "workspace_activate,name:dev"),
@@ -513,15 +521,20 @@ class HyprManagementTests(unittest.TestCase):
         )
 
         legacy_calls = []
-        with mock.patch.object(portalctl, "is_lua_config_provider", return_value=False), mock.patch.object(
-            portalctl.subprocess,
-            "run",
-            side_effect=lambda argv, **_kwargs: legacy_calls.append(tuple(argv)) or __import__("subprocess").CompletedProcess(argv, 0, "ok", ""),
-        ):
+
+        def fake_legacy_run(argv, **_kwargs):
+            legacy_calls.append(tuple(argv))
+            stdout = "configProvider: legacy\n" if "systeminfo" in argv else "ok"
+            return __import__("subprocess").CompletedProcess(argv, 0, stdout, "")
+
+        with mock.patch.object(portalctl.subprocess, "run", side_effect=fake_legacy_run):
             portalctl.dispatch("hypr-agent-protal:manage", payload)
+        legacy_probes = [call for call in legacy_calls if call and call[0] == "hyprctl" and "systeminfo" in call]
+        self.assertEqual(len(legacy_probes), 1, legacy_calls)
+        legacy_manage_calls = [call for call in legacy_calls if call[:3] == ("hyprctl", "dispatch", "hypr-agent-protal:manage")]
         self.assertEqual(
-            legacy_calls[0],
-            ("hyprctl", "dispatch", "hypr-agent-protal:manage", payload),
+            legacy_manage_calls,
+            [("hyprctl", "dispatch", "hypr-agent-protal:manage", payload)],
         )
 
 

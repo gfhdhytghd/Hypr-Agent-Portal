@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -31,6 +32,12 @@ def main() -> int:
         ]
     )
 
+    smoke_env = os.environ.copy()
+    # CI/package smoke must not depend on a Hyprland installation. The MCP
+    # transport and tool catalog should initialize headlessly; actual desktop
+    # actions retain their explicit runtime diagnostics.
+    smoke_env["PATH"] = ""
+    smoke_env.pop("HYPRLAND_INSTANCE_SIGNATURE", None)
     proc = subprocess.run(
         [sys.executable, str(script)],
         input=payload,
@@ -38,6 +45,7 @@ def main() -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=repo,
+        env=smoke_env,
         check=False,
     )
     if proc.returncode != 0:

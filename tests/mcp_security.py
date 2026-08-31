@@ -2286,6 +2286,26 @@ def test_mcp_type_into_atspi_binds_exact_second_editable_direct_and_computer() -
     assert len(delivered) == delivered_before
 
 
+def test_mcp_headless_environment_without_hyprctl_starts_and_runtime_fails_clearly() -> None:
+    with security_environment():
+        module = load_path(MCP, "mcp_headless_no_hyprctl")
+    original_which = module.shutil.which
+    module.shutil.which = lambda command, path=None: None if command == "hyprctl" else original_which(command, path=path)
+    try:
+        env = module.ensure_session_environment()
+        assert isinstance(env, dict) and env.get("XDG_RUNTIME_DIR")
+        listed = module.handle({"jsonrpc": "2.0", "id": 700, "method": "tools/list", "params": {}})
+        assert listed is not None and listed["result"]["tools"]
+        try:
+            module.hyprctl_json("clients", "-j")
+        except RuntimeError as exc:
+            assert "hyprctl is unavailable" in str(exc)
+        else:
+            raise AssertionError("headless compositor action did not report missing hyprctl")
+    finally:
+        module.shutil.which = original_which
+
+
 def test_mcp_workspace_semantics_match_direct_and_computer_handlers() -> None:
     with security_environment():
         module = load_path(MCP, "mcp_workspace_semantics")
@@ -2374,6 +2394,7 @@ TESTS = [
     test_mcp_wait_backend_does_not_leak_unselected_privacy_event,
     test_mcp_related_privacy_filter_and_sequence_singleton_claim,
     test_mcp_type_into_atspi_binds_exact_second_editable_direct_and_computer,
+    test_mcp_headless_environment_without_hyprctl_starts_and_runtime_fails_clearly,
     test_mcp_workspace_semantics_match_direct_and_computer_handlers,
 ]
 

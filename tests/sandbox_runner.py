@@ -200,13 +200,15 @@ class SandboxRunnerTests(unittest.TestCase):
         )
         assert leader.stdout is not None
         child_pid = int(leader.stdout.readline())
+        self.assertTrue(namespace["process_is_running"](child_pid))
         leader.stdout.close()
         leader.wait(timeout=5)
         namespace["terminate_marked_processes"](marker, timeout=0.1)
         deadline = time.monotonic() + 3.0
-        while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+        while namespace["process_is_running"](child_pid) and time.monotonic() < deadline:
             time.sleep(0.05)
-        self.assertFalse(Path(f"/proc/{child_pid}").exists())
+        self.assertFalse(namespace["process_is_running"](child_pid))
+        self.assertFalse(namespace["process_group_exists"](leader.pid))
 
 
 if __name__ == "__main__":

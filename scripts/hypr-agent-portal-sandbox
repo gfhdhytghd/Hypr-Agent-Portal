@@ -348,13 +348,25 @@ def start_dbus(env: dict[str, str], log_path: Path) -> tuple[subprocess.Popen[st
         selector.close()
 
 
-def process_start_time(pid: int) -> int | None:
+def process_stat(pid: int) -> tuple[str, int, int] | None:
     try:
         stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         fields = stat_line[stat_line.rfind(") ") + 2 :].split()
-        return int(fields[19])
+        return fields[0], int(fields[2]), int(fields[19])
     except (OSError, ValueError, IndexError):
         return None
+
+
+def process_is_running(pid: int) -> bool:
+    stat_record = process_stat(pid)
+    return stat_record is not None and stat_record[0] not in {"Z", "X"}
+
+
+def process_start_time(pid: int) -> int | None:
+    stat_record = process_stat(pid)
+    if stat_record is None or stat_record[0] in {"Z", "X"}:
+        return None
+    return stat_record[2]
 
 
 def process_matches(pid: object, start_time: object) -> bool:
@@ -404,7 +416,19 @@ def process_group_exists(pgid: int) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    saw_member = False
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        stat_record = process_stat(int(entry.name))
+        if stat_record is None or stat_record[1] != pgid:
+            continue
+        saw_member = True
+        if stat_record[0] not in {"Z", "X"}:
+            return True
+    # killpg confirmed the group exists. Only report it gone when /proc showed
+    # that every remaining member is a non-runnable zombie/dead task.
+    return not saw_member
 
 
 def wait_for_group_exit(pgid: int, timeout: float, proc: subprocess.Popen[Any] | None = None) -> bool:

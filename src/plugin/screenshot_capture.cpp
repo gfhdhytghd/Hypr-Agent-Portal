@@ -23,6 +23,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -31,16 +33,18 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <sys/random.h>
 #include <unistd.h>
 #include <vector>
 
 using Render::GL::g_pHyprOpenGL;
 
-namespace hypr_agent_protal {
+namespace hypr_agent_portal {
 namespace {
 
 using Json = nlohmann::ordered_json;
@@ -209,11 +213,29 @@ RgbaReadback readRgbaFramebufferRegion(Render::GL::CGLFramebuffer& framebuffer, 
     return readback;
 }
 
+bool unlinkIfSameFile(const std::filesystem::path& path, dev_t device, ino_t inode) {
+    struct stat current {};
+    if (lstat(path.c_str(), &current) != 0)
+        return errno == ENOENT;
+    if (!S_ISREG(current.st_mode) || current.st_dev != device || current.st_ino != inode)
+        return false;
+    return unlink(path.c_str()) == 0;
+}
+
 bool writeFileExclusive(const std::filesystem::path& path, const std::vector<unsigned char>& bytes) {
     const auto native = path.string();
-    const int  fd = open(native.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    const int  fd = open(native.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0)
         return false;
+
+    struct stat info {};
+    if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_uid != geteuid() ||
+        (info.st_mode & (S_IRWXG | S_IRWXO)) != 0 || fchmod(fd, 0600) != 0) {
+        close(fd);
+        if (info.st_ino != 0)
+            unlinkIfSameFile(path, info.st_dev, info.st_ino);
+        return false;
+    }
 
     const auto* data = reinterpret_cast<const char*>(bytes.data());
     std::size_t written = 0;
@@ -223,16 +245,22 @@ bool writeFileExclusive(const std::filesystem::path& path, const std::vector<uns
             if (errno == EINTR)
                 continue;
             close(fd);
+            unlinkIfSameFile(path, info.st_dev, info.st_ino);
             return false;
         }
         if (chunk == 0) {
             close(fd);
+            unlinkIfSameFile(path, info.st_dev, info.st_ino);
             return false;
         }
         written += static_cast<std::size_t>(chunk);
     }
 
-    return close(fd) == 0;
+    if (close(fd) != 0) {
+        unlinkIfSameFile(path, info.st_dev, info.st_ino);
+        return false;
+    }
+    return true;
 }
 
 void unpremultiplyAlpha(RgbaReadback& readback) {
@@ -307,10 +335,11 @@ CBox renderedWindowBox(const PHLWINDOW& window, CBox box) {
 }
 
 CBox renderedWindowMainSurfaceBox(const PHLWINDOW& window) {
-    if (!window || !window->m_realPosition || !window->m_realSize)
+    if (!window || !window->positionAnimation() || !window->sizeAnimation())
         return {};
 
-    CBox box{window->m_realPosition->goal().x, window->m_realPosition->goal().y, window->m_realSize->goal().x, window->m_realSize->goal().y};
+    CBox box{window->positionAnimation()->goal().x, window->positionAnimation()->goal().y, window->sizeAnimation()->goal().x,
+             window->sizeAnimation()->goal().y};
     return renderedWindowBox(window, box);
 }
 
@@ -324,30 +353,30 @@ CBox inputWindowBox(const PHLWINDOW& window, CBox renderedBox) {
 class WindowAnimationGoalOverride {
   public:
     explicit WindowAnimationGoalOverride(const PHLWINDOW& window) : m_window(window) {
-        if (!m_window || !m_window->m_realPosition || !m_window->m_realSize)
+        if (!m_window || !m_window->positionAnimation() || !m_window->sizeAnimation())
             return;
 
-        m_position = m_window->m_realPosition->value();
-        m_size = m_window->m_realSize->value();
+        m_position = m_window->positionAnimation()->value();
+        m_size = m_window->sizeAnimation()->value();
         m_active = true;
         setPositionOffset({});
     }
 
     void setPositionOffset(const Vector2D& offset) {
-        if (!m_active || !m_window || !m_window->m_realPosition || !m_window->m_realSize)
+        if (!m_active || !m_window || !m_window->positionAnimation() || !m_window->sizeAnimation())
             return;
 
-        m_window->m_realPosition->value() = m_window->m_realPosition->goal() + offset;
-        m_window->m_realSize->value() = m_window->m_realSize->goal();
+        m_window->positionAnimation()->value() = m_window->positionAnimation()->goal() + offset;
+        m_window->sizeAnimation()->value() = m_window->sizeAnimation()->goal();
         m_window->updateWindowDecos();
     }
 
     ~WindowAnimationGoalOverride() {
-        if (!m_active || !m_window || !m_window->m_realPosition || !m_window->m_realSize)
+        if (!m_active || !m_window || !m_window->positionAnimation() || !m_window->sizeAnimation())
             return;
 
-        m_window->m_realPosition->value() = m_position;
-        m_window->m_realSize->value() = m_size;
+        m_window->positionAnimation()->value() = m_position;
+        m_window->sizeAnimation()->value() = m_size;
         m_window->updateWindowDecos();
     }
 
@@ -510,36 +539,147 @@ Json windowJson(const PHLWINDOW& window) {
 }
 
 std::string sessionId() {
-    const auto now = Time::millis(Time::steadyNow());
+    std::array<unsigned char, 16> randomBytes {};
+    std::size_t                   offset = 0;
+    while (offset < randomBytes.size()) {
+        const auto count = getrandom(randomBytes.data() + offset, randomBytes.size() - offset, 0);
+        if (count > 0) {
+            offset += static_cast<std::size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+
+    static std::atomic_uint64_t fallbackCounter = 0;
     std::ostringstream out;
-    out << std::hex << now << "-" << getpid();
+    out << std::hex << std::setfill('0');
+    if (offset == randomBytes.size()) {
+        for (const auto byte : randomBytes)
+            out << std::setw(2) << static_cast<unsigned int>(byte);
+    } else {
+        out << Time::millis(Time::steadyNow()) << '-' << getpid() << '-' << fallbackCounter.fetch_add(1, std::memory_order_relaxed);
+    }
     return out.str();
 }
 
+int openPrivateArtifactParent(const std::filesystem::path& path, std::string& error) {
+    struct stat before {};
+    if (lstat(path.c_str(), &before) != 0) {
+        error = "screenshot output directory is unavailable: " + std::string(strerror(errno));
+        return -1;
+    }
+    if (S_ISLNK(before.st_mode) || !S_ISDIR(before.st_mode) || before.st_uid != geteuid() || (before.st_mode & 0777) != 0700) {
+        error = "screenshot output directory must be a non-symlink directory owned by the compositor uid with mode 0700";
+        return -1;
+    }
+    const int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        error = "failed to securely open screenshot output directory: " + std::string(strerror(errno));
+        return -1;
+    }
+    struct stat opened {};
+    if (fstat(fd, &opened) != 0 || !S_ISDIR(opened.st_mode) || opened.st_uid != geteuid() || (opened.st_mode & 0777) != 0700 ||
+        opened.st_dev != before.st_dev || opened.st_ino != before.st_ino) {
+        close(fd);
+        error = "screenshot output directory changed during validation";
+        return -1;
+    }
+    return fd;
+}
+
+bool removeEmptyArtifactDirectoryIfSame(const std::filesystem::path& path, dev_t device, ino_t inode) {
+    struct stat current {};
+    if (lstat(path.c_str(), &current) != 0)
+        return errno == ENOENT;
+    if (!S_ISDIR(current.st_mode) || S_ISLNK(current.st_mode) || current.st_uid != geteuid() || current.st_dev != device || current.st_ino != inode)
+        return false;
+    return rmdir(path.c_str()) == 0;
+}
+
+class ArtifactCleanup {
+  public:
+    ArtifactCleanup(std::filesystem::path root, dev_t device, ino_t inode) : m_root(std::move(root)), m_device(device), m_inode(inode) {}
+    ~ArtifactCleanup() {
+        if (!m_active)
+            return;
+        for (const auto& file : m_files)
+            unlinkIfSameFile(file.path, file.device, file.inode);
+        removeEmptyArtifactDirectoryIfSame(m_root, m_device, m_inode);
+    }
+    void track(const std::filesystem::path& path) {
+        struct stat info {};
+        if (lstat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == geteuid())
+            m_files.push_back({path, info.st_dev, info.st_ino});
+    }
+    void release() { m_active = false; }
+
+  private:
+    struct TrackedFile {
+        std::filesystem::path path;
+        dev_t                 device = 0;
+        ino_t                 inode = 0;
+    };
+    std::filesystem::path    m_root;
+    dev_t                    m_device = 0;
+    ino_t                    m_inode = 0;
+    std::vector<TrackedFile> m_files;
+    bool                     m_active = true;
+};
+
 } // namespace
 
-ScreenshotResult captureScreenshotSession(const std::filesystem::path& outputJsonPath, std::string_view targetRegex) {
+ScreenshotResult captureScreenshotSession(const std::filesystem::path& outputJsonPath, const PHLWINDOW& targetWindow) {
     if (!g_pCompositor || !g_pHyprRenderer || !g_pHyprOpenGL)
         return {.success = false, .error = "Hyprland renderer is not ready"};
     if (outputJsonPath.empty())
         return {.success = false, .error = "missing output json path"};
 
-    std::error_code ec;
-    const auto      parent = outputJsonPath.parent_path();
-    if (!parent.empty())
-        std::filesystem::create_directories(parent, ec);
-    if (ec)
-        return {.success = false, .error = "failed to create output directory: " + ec.message()};
+    const auto parent = outputJsonPath.parent_path();
+    if (parent.empty() || outputJsonPath.filename().empty() || outputJsonPath.filename() == "." || outputJsonPath.filename() == "..")
+        return {.success = false, .error = "screenshot output path must name a file inside a private directory"};
 
-    const auto id = sessionId();
-    const auto artifactRoot = parent / id;
-    std::filesystem::create_directories(artifactRoot, ec);
-    if (ec)
-        return {.success = false, .error = "failed to create artifact directory: " + ec.message()};
+    std::string parentError;
+    const int   parentFd = openPrivateArtifactParent(parent, parentError);
+    if (parentFd < 0)
+        return {.success = false, .error = parentError};
+
+    std::string           id;
+    std::filesystem::path artifactRoot;
+    int                   artifactFd = -1;
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        id = sessionId();
+        if (mkdirat(parentFd, id.c_str(), 0700) != 0) {
+            if (errno == EEXIST)
+                continue;
+            const auto message = std::string(strerror(errno));
+            close(parentFd);
+            return {.success = false, .error = "failed to create artifact directory: " + message};
+        }
+        artifactRoot = parent / id;
+        artifactFd = openat(parentFd, id.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        break;
+    }
+    if (artifactFd < 0) {
+        close(parentFd);
+        return {.success = false, .error = "failed to create a unique private artifact directory"};
+    }
+    struct stat artifactInfo {};
+    if (fstat(artifactFd, &artifactInfo) != 0 || !S_ISDIR(artifactInfo.st_mode) || artifactInfo.st_uid != geteuid() ||
+        (artifactInfo.st_mode & 0777) != 0700) {
+        close(artifactFd);
+        unlinkat(parentFd, id.c_str(), AT_REMOVEDIR);
+        close(parentFd);
+        return {.success = false, .error = "new screenshot artifact directory failed ownership or permission validation"};
+    }
+    close(artifactFd);
+    close(parentFd);
+    ArtifactCleanup artifactCleanup(artifactRoot, artifactInfo.st_dev, artifactInfo.st_ino);
 
     Json root;
     root["id"] = id;
-    root["mode"] = targetRegex.empty() ? "monitors" : "window";
+    root["mode"] = targetWindow ? "window" : "monitors";
     root["monitors"] = Json::array();
     root["windows"] = Json::array();
 
@@ -549,8 +689,8 @@ ScreenshotResult captureScreenshotSession(const std::filesystem::path& outputJso
     }
 
     const auto frozenTime = Time::steadyNow();
-    if (!targetRegex.empty()) {
-        const auto window = Desktop::viewState()->query().selector(targetRegex).mappedOnly().runWindow();
+    if (targetWindow) {
+        const auto window = targetWindow;
         if (!window || !window->m_isMapped)
             return {.success = false, .error = "target window not found"};
 
@@ -564,6 +704,7 @@ ScreenshotResult captureScreenshotSession(const std::filesystem::path& outputJso
         const auto artifactPath = artifactRoot / ("window-" + pointerId(window.get()) + ".rgba");
         if (!renderWindowArtifact(window, monitor, frozenTime, artifactPath, width, height, artifactBox))
             return {.success = false, .error = "failed to render target window"};
+        artifactCleanup.track(artifactPath);
 
         const double scale = monitor->m_scale <= 0.0 ? 1.0 : monitor->m_scale;
         root["target"] = windowJson(window);
@@ -591,6 +732,7 @@ ScreenshotResult captureScreenshotSession(const std::filesystem::path& outputJso
         if (!writeFileExclusive(outputJsonPath, bytes))
             return {.success = false, .error = "failed to write output json"};
 
+        artifactCleanup.release();
         return {.success = true};
     }
 
@@ -603,6 +745,8 @@ ScreenshotResult captureScreenshotSession(const std::filesystem::path& outputJso
         int        height = 0;
         const auto artifactPath = artifactRoot / ("monitor-" + std::to_string(monitorIndex) + ".rgba");
         const bool rendered = renderMonitorArtifact(monitor, frozenTime, artifactPath, width, height);
+        if (rendered)
+            artifactCleanup.track(artifactPath);
 
         root["monitors"].push_back(Json{
             {"name", boundedString(monitor->m_name, 4096)},
@@ -628,7 +772,8 @@ ScreenshotResult captureScreenshotSession(const std::filesystem::path& outputJso
     if (!writeFileExclusive(outputJsonPath, bytes))
         return {.success = false, .error = "failed to write output json"};
 
+    artifactCleanup.release();
     return {.success = true};
 }
 
-} // namespace hypr_agent_protal
+} // namespace hypr_agent_portal

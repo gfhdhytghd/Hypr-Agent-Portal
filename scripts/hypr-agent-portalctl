@@ -1,0 +1,1092 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import os
+import pathlib
+import re
+import secrets
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import zlib
+
+
+CURSOR_BITMAP = [
+    "X...........",
+    "XX..........",
+    "X.X.........",
+    "X..X........",
+    "X...X.......",
+    "X....X......",
+    "X.....X.....",
+    "X......X....",
+    "X.......X...",
+    "X........X..",
+    "X.....XXXX..",
+    "X..X..X.....",
+    "X.X.X..X....",
+    "XX..X..X....",
+    "X....X..X...",
+    ".....X..X...",
+    "......XX....",
+]
+
+
+def _chunk(kind: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+
+def rgba_to_png(width: int, height: int, rgba: bytes) -> bytes:
+    if width <= 0 or height <= 0:
+        raise ValueError("invalid image dimensions")
+    expected = width * height * 4
+    if len(rgba) != expected:
+        raise ValueError(f"rgba byte count mismatch: got {len(rgba)}, expected {expected}")
+
+    rows = bytearray()
+    stride = width * 4
+    for y in range(height):
+        rows.append(0)
+        start = y * stride
+        rows.extend(rgba[start : start + stride])
+
+    return b"".join(
+        [
+            b"\x89PNG\r\n\x1a\n",
+            _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)),
+            _chunk(b"IDAT", zlib.compress(bytes(rows), 6)),
+            _chunk(b"IEND", b""),
+        ]
+    )
+
+
+def resize_rgba_bilinear(src: bytes, src_w: int, src_h: int, dst_w: int, dst_h: int) -> bytes:
+    if dst_w <= 0 or dst_h <= 0:
+        raise ValueError("invalid resized image dimensions")
+    if src_w == dst_w and src_h == dst_h:
+        return src
+
+    dst = bytearray(dst_w * dst_h * 4)
+    x_ratio = src_w / dst_w
+    y_ratio = src_h / dst_h
+    for y in range(dst_h):
+        sy = (y + 0.5) * y_ratio - 0.5
+        y0 = max(0, min(src_h - 1, int(sy)))
+        y1 = max(0, min(src_h - 1, y0 + 1))
+        wy = sy - y0
+        if wy < 0:
+            wy = 0.0
+        for x in range(dst_w):
+            sx = (x + 0.5) * x_ratio - 0.5
+            x0 = max(0, min(src_w - 1, int(sx)))
+            x1 = max(0, min(src_w - 1, x0 + 1))
+            wx = sx - x0
+            if wx < 0:
+                wx = 0.0
+            i00 = (y0 * src_w + x0) * 4
+            i10 = (y0 * src_w + x1) * 4
+            i01 = (y1 * src_w + x0) * 4
+            i11 = (y1 * src_w + x1) * 4
+            out = (y * dst_w + x) * 4
+            for channel in range(4):
+                top = src[i00 + channel] * (1.0 - wx) + src[i10 + channel] * wx
+                bottom = src[i01 + channel] * (1.0 - wx) + src[i11 + channel] * wx
+                dst[out + channel] = max(0, min(255, round(top * (1.0 - wy) + bottom * wy)))
+    return bytes(dst)
+
+
+def model_output_dimensions(width: int, height: int, logical_width: float, logical_height: float, mode: str, max_dimension: int) -> tuple[int, int]:
+    if mode == "logical" and logical_width > 0 and logical_height > 0:
+        width = max(1, round(logical_width))
+        height = max(1, round(logical_height))
+    if max_dimension > 0 and max(width, height) > max_dimension:
+        scale = max_dimension / max(width, height)
+        width = max(1, round(width * scale))
+        height = max(1, round(height * scale))
+    return width, height
+
+
+PRIVATE_ROOT_NAME = f"hypr-agent-portal-{os.getuid()}"
+MAX_CURSOR_STATE_BYTES = 1024 * 1024
+
+
+def _validated_private_directory(path: pathlib.Path, *, label: str) -> int:
+    """Open a private directory without following its final path component."""
+    try:
+        before = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError(f"{label} is unavailable: {path}: {exc.strerror}") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise RuntimeError(f"{label} must be a real directory, not a symlink: {path}")
+    if before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) != 0o700:
+        raise RuntimeError(f"{label} must be owned by uid {os.getuid()} with mode 0700: {path}")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError(f"cannot securely open {label}: {path}: {exc.strerror}") from exc
+    opened = os.fstat(fd)
+    if not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.getuid() or stat.S_IMODE(opened.st_mode) != 0o700:
+        os.close(fd)
+        raise RuntimeError(f"{label} changed during validation: {path}")
+    if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+        os.close(fd)
+        raise RuntimeError(f"{label} changed during validation: {path}")
+    return fd
+
+
+def state_root(output_dir: str | None = None) -> pathlib.Path:
+    if output_dir:
+        base = pathlib.Path(output_dir).expanduser().absolute()
+        base_fd = _validated_private_directory(base, label="screenshot output directory")
+    else:
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        if runtime:
+            base = pathlib.Path(runtime).absolute()
+            base_fd = _validated_private_directory(base, label="XDG_RUNTIME_DIR")
+        else:
+            base = pathlib.Path(tempfile.gettempdir()).absolute()
+            try:
+                base_info = os.lstat(base)
+            except OSError as exc:
+                raise RuntimeError(f"temporary directory is unavailable: {base}: {exc.strerror}") from exc
+            if stat.S_ISLNK(base_info.st_mode) or not stat.S_ISDIR(base_info.st_mode):
+                raise RuntimeError(f"temporary directory must be a real directory: {base}")
+            base_fd = os.open(base, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+
+    try:
+        try:
+            os.mkdir(PRIVATE_ROOT_NAME, mode=0o700, dir_fd=base_fd)
+        except FileExistsError:
+            pass
+    finally:
+        os.close(base_fd)
+
+    root = base / PRIVATE_ROOT_NAME
+    root_fd = _validated_private_directory(root, label="hypr-agent-portal private state directory")
+    os.close(root_fd)
+    return root
+
+
+def _write_exclusive(root: pathlib.Path, name: str, data: bytes) -> pathlib.Path:
+    if pathlib.PurePath(name).name != name or name in {"", ".", ".."}:
+        raise RuntimeError("invalid private artifact name")
+    root_fd = _validated_private_directory(root, label="hypr-agent-portal private state directory")
+    fd = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(name, flags, 0o600, dir_fd=root_fd)
+        with os.fdopen(fd, "wb", closefd=True) as stream:
+            fd = -1
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(root_fd)
+    return root / name
+
+
+def _atomic_write_private(root: pathlib.Path, name: str, data: bytes) -> pathlib.Path:
+    temp_name = f".{name}.{secrets.token_hex(12)}.tmp"
+    temp_path = _write_exclusive(root, temp_name, data)
+    root_fd = _validated_private_directory(root, label="hypr-agent-portal private state directory")
+    try:
+        os.replace(temp_name, name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        os.fsync(root_fd)
+    except Exception:
+        try:
+            os.unlink(temp_name, dir_fd=root_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(root_fd)
+    return root / name
+
+
+def _artifact_record(path: pathlib.Path, *, directory: bool = False) -> dict:
+    info = os.lstat(path)
+    expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if not expected or stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+        raise RuntimeError(f"unsafe screenshot artifact: {path}")
+    required_mode = 0o700 if directory else 0o600
+    if stat.S_IMODE(info.st_mode) != required_mode:
+        raise RuntimeError(f"screenshot artifact has unsafe permissions (expected {required_mode:04o}): {path}")
+    return {"path": str(path), "device": int(info.st_dev), "inode": int(info.st_ino)}
+
+
+def _screenshot_provenance(root: pathlib.Path, session_path: pathlib.Path, png_path: pathlib.Path | None, session: dict) -> dict:
+    session_id = str(session.get("id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+        raise RuntimeError("invalid native screenshot artifact id")
+    artifact_root = root / session_id
+    file_paths = [session_path]
+    if png_path is not None:
+        file_paths.append(png_path)
+    for monitor in session.get("monitors", []):
+        raw_path = monitor.get("artifactPath") if isinstance(monitor, dict) else None
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        candidate = pathlib.Path(raw_path)
+        if candidate.parent != artifact_root or candidate.name in {"", ".", ".."}:
+            raise RuntimeError("native screenshot returned an artifact outside its private session directory")
+        file_paths.append(candidate)
+    unique_paths = list(dict.fromkeys(file_paths))
+    return {
+        "root": str(root),
+        "files": [_artifact_record(path) for path in unique_paths],
+        "directories": [_artifact_record(artifact_root, directory=True)],
+    }
+
+
+def cleanup_screenshot_provenance(provenance: dict) -> None:
+    """Remove only inode-bound artifacts created for this screenshot request."""
+    for record in provenance.get("files", []):
+        path = pathlib.Path(str(record.get("path") or ""))
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if (int(info.st_dev), int(info.st_ino)) != (int(record.get("device", -1)), int(record.get("inode", -1))):
+            continue
+        if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid():
+            path.unlink()
+    for record in reversed(provenance.get("directories", [])):
+        path = pathlib.Path(str(record.get("path") or ""))
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if (int(info.st_dev), int(info.st_ino)) != (int(record.get("device", -1)), int(record.get("inode", -1))):
+            continue
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid():
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+
+
+def cursor_state_path(output_dir: str | None = None) -> pathlib.Path:
+    return state_root(output_dir) / "cursor.json"
+
+
+def finite_float(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def read_agent_cursor(path: pathlib.Path) -> dict | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size > MAX_CURSOR_STATE_BYTES
+        ):
+            os.close(fd)
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            data = json.loads(stream.read(MAX_CURSOR_STATE_BYTES + 1))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    x = finite_float(data.get("x"))
+    y = finite_float(data.get("y"))
+    if x is None or y is None:
+        return None
+    return {**data, "x": x, "y": y}
+
+
+def write_agent_cursor(path: pathlib.Path, *, target: str, x: float, y: float, action: str, button: str) -> None:
+    payload = {
+        "x": float(x),
+        "y": float(y),
+        "target": target,
+        "action": action,
+        "button": button,
+        "timestamp": time.time(),
+    }
+    _atomic_write_private(path.parent, path.name, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def select_cursor_position(session: dict, source: str, cursor_path: pathlib.Path) -> tuple[dict | None, str]:
+    if source == "none":
+        return None, "none"
+
+    agent_cursor = read_agent_cursor(cursor_path)
+    if source in {"auto", "agent"} and agent_cursor is not None:
+        return {"x": agent_cursor["x"], "y": agent_cursor["y"]}, "agent"
+
+    if source == "agent":
+        return None, "agent"
+
+    compositor_cursor = session.get("cursorPosition")
+    if isinstance(compositor_cursor, dict):
+        x = finite_float(compositor_cursor.get("x"))
+        y = finite_float(compositor_cursor.get("y"))
+        if x is not None and y is not None:
+            return {"x": x, "y": y}, "hyprland"
+
+    return None, "hyprland" if source == "hyprland" else "none"
+
+
+def blend_pixel(canvas: bytearray, width: int, height: int, x: int, y: int, color: tuple[int, int, int, int]) -> None:
+    if x < 0 or y < 0 or x >= width or y >= height:
+        return
+
+    r, g, b, a = color
+    idx = (y * width + x) * 4
+    if a >= 255:
+        canvas[idx : idx + 4] = bytes((r, g, b, 255))
+        return
+
+    inv = 255 - a
+    canvas[idx] = (r * a + canvas[idx] * inv) // 255
+    canvas[idx + 1] = (g * a + canvas[idx + 1] * inv) // 255
+    canvas[idx + 2] = (b * a + canvas[idx + 2] * inv) // 255
+    canvas[idx + 3] = 255
+
+
+def blend_rect(canvas: bytearray, width: int, height: int, x: int, y: int, size: int, color: tuple[int, int, int, int]) -> None:
+    for yy in range(y, y + size):
+        for xx in range(x, x + size):
+            blend_pixel(canvas, width, height, xx, yy, color)
+
+
+def draw_cursor_indicator(canvas: bytearray, width: int, height: int, x: int, y: int, scale: float) -> None:
+    unit = max(1, min(3, round(scale)))
+    fill_cells = [(cx, cy) for cy, row in enumerate(CURSOR_BITMAP) for cx, value in enumerate(row) if value == "X"]
+    fill_set = set(fill_cells)
+
+    shadow_offset = max(1, unit)
+    for cx, cy in fill_cells:
+        blend_rect(canvas, width, height, x + shadow_offset + cx * unit, y + shadow_offset + cy * unit, unit, (0, 0, 0, 80))
+
+    for cx, cy in fill_cells:
+        for oy in (-1, 0, 1):
+            for ox in (-1, 0, 1):
+                if (cx + ox, cy + oy) not in fill_set:
+                    blend_rect(canvas, width, height, x + (cx + ox) * unit, y + (cy + oy) * unit, unit, (255, 255, 255, 230))
+
+    for cx, cy in fill_cells:
+        blend_rect(canvas, width, height, x + cx * unit, y + cy * unit, unit, (18, 18, 18, 245))
+
+
+def render_session_png(
+    session: dict,
+    *,
+    cursor_source: str = "none",
+    cursor_path: pathlib.Path | None = None,
+    model_resolution: str = "full",
+    max_dimension: int = 0,
+) -> tuple[bytes, dict]:
+    monitors = [m for m in session.get("monitors", []) if m.get("artifactPath") and m.get("artifactWidth") and m.get("artifactHeight")]
+    if not monitors:
+        raise RuntimeError("no rendered monitor artifacts in screenshot session")
+
+    min_x = min(float(m["geometry"]["x"]) for m in monitors)
+    min_y = min(float(m["geometry"]["y"]) for m in monitors)
+    max_x = max(float(m["geometry"]["x"]) + float(m["geometry"]["width"]) for m in monitors)
+    max_y = max(float(m["geometry"]["y"]) + float(m["geometry"]["height"]) for m in monitors)
+    out_scale = max(float(m.get("scale") or 1.0) for m in monitors)
+    out_w = max(1, round((max_x - min_x) * out_scale))
+    out_h = max(1, round((max_y - min_y) * out_scale))
+    canvas = bytearray(out_w * out_h * 4)
+
+    for m in monitors:
+        src_w = int(m["artifactWidth"])
+        src_h = int(m["artifactHeight"])
+        artifact_path = pathlib.Path(m["artifactPath"])
+        fd = os.open(artifact_path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            os.close(fd)
+            raise RuntimeError(f"unsafe screenshot artifact: {artifact_path}")
+        with os.fdopen(fd, "rb") as stream:
+            raw = stream.read()
+        if len(raw) != src_w * src_h * 4:
+            raise RuntimeError(f"invalid artifact size for {m['artifactPath']}")
+
+        geom = m["geometry"]
+        dst_x = round((float(geom["x"]) - min_x) * out_scale)
+        dst_y = round((float(geom["y"]) - min_y) * out_scale)
+        dst_w = max(1, round(float(geom["width"]) * out_scale))
+        dst_h = max(1, round(float(geom["height"]) * out_scale))
+
+        if dst_x == 0 and dst_y == 0 and src_w == dst_w == out_w and src_h == dst_h == out_h:
+            canvas[:] = raw
+            continue
+
+        if src_w == dst_w:
+            source_stride = src_w * 4
+            for y in range(dst_h):
+                out_y = dst_y + y
+                if out_y < 0 or out_y >= out_h:
+                    continue
+                source_start = y * source_stride
+                source_x = max(0, -dst_x)
+                destination_x = max(0, dst_x)
+                copy_width = min(src_w - source_x, out_w - destination_x)
+                if copy_width <= 0:
+                    continue
+                source_start += source_x * 4
+                destination_start = (out_y * out_w + destination_x) * 4
+                byte_count = copy_width * 4
+                canvas[destination_start : destination_start + byte_count] = raw[source_start : source_start + byte_count]
+            continue
+
+        for y in range(dst_h):
+            sy = min(src_h - 1, int(y * src_h / dst_h))
+            out_y = dst_y + y
+            if out_y < 0 or out_y >= out_h:
+                continue
+            for x in range(dst_w):
+                sx = min(src_w - 1, int(x * src_w / dst_w))
+                out_x = dst_x + x
+                if out_x < 0 or out_x >= out_w:
+                    continue
+                src_i = (sy * src_w + sx) * 4
+                dst_i = (out_y * out_w + out_x) * 4
+                canvas[dst_i : dst_i + 4] = raw[src_i : src_i + 4]
+
+    indicator_position = None
+    indicator_source = "none"
+    indicator_pixel = None
+    if cursor_path is not None:
+        indicator_position, indicator_source = select_cursor_position(session, cursor_source, cursor_path)
+        if indicator_position is not None:
+            cursor_x = float(indicator_position["x"])
+            cursor_y = float(indicator_position["y"])
+            if min_x <= cursor_x <= max_x and min_y <= cursor_y <= max_y:
+                pixel_x = round((cursor_x - min_x) * out_scale)
+                pixel_y = round((cursor_y - min_y) * out_scale)
+                draw_cursor_indicator(canvas, out_w, out_h, pixel_x, pixel_y, out_scale)
+                indicator_pixel = {"x": pixel_x, "y": pixel_y}
+
+    source_w = out_w
+    source_h = out_h
+    source_scale = out_scale
+    logical_width = max_x - min_x
+    logical_height = max_y - min_y
+    model_w, model_h = model_output_dimensions(out_w, out_h, logical_width, logical_height, model_resolution, max_dimension)
+    if model_w != out_w or model_h != out_h:
+        canvas_bytes = resize_rgba_bilinear(bytes(canvas), out_w, out_h, model_w, model_h)
+        out_w = model_w
+        out_h = model_h
+    else:
+        canvas_bytes = bytes(canvas)
+    out_scale_x = out_w / logical_width if logical_width > 0 else out_scale
+    out_scale_y = out_h / logical_height if logical_height > 0 else out_scale
+
+    metadata = {
+        "width": out_w,
+        "height": out_h,
+        "scale": out_scale_x,
+        "scaleX": out_scale_x,
+        "scaleY": out_scale_y,
+        "sourceWidth": source_w,
+        "sourceHeight": source_h,
+        "sourceScale": source_scale,
+        "modelDownsample": {
+            "enabled": source_w != out_w or source_h != out_h,
+            "mode": model_resolution,
+            "maxDimension": max_dimension,
+        },
+        "logicalBounds": {"x": min_x, "y": min_y, "width": max_x - min_x, "height": max_y - min_y},
+        "cursorPosition": indicator_position or session.get("cursorPosition"),
+        "compositorCursorPosition": session.get("cursorPosition"),
+        "cursorIndicator": {
+            "enabled": cursor_source != "none",
+            "visible": indicator_pixel is not None,
+            "source": indicator_source,
+            "position": indicator_position,
+            "pixelPosition": indicator_pixel,
+        },
+        "windows": session.get("windows", []),
+        "monitors": [
+            {
+                "name": m.get("name"),
+                "geometry": m.get("geometry"),
+                "scale": m.get("scale"),
+                "artifactWidth": m.get("artifactWidth"),
+                "artifactHeight": m.get("artifactHeight"),
+            }
+            for m in monitors
+        ],
+    }
+    return rgba_to_png(out_w, out_h, canvas_bytes), metadata
+
+
+def hyprctl_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return env
+
+    proc = subprocess.run(["hyprctl", "instances", "-j"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, check=False)
+    if proc.returncode == 0 and proc.stdout.strip():
+        try:
+            instances = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            instances = []
+
+        if instances:
+            wayland_display = env.get("WAYLAND_DISPLAY")
+            matching = [item for item in instances if wayland_display and item.get("wl_socket") == wayland_display]
+            selected = max(matching or instances, key=lambda item: int(item.get("time") or 0))
+            if selected.get("instance"):
+                env["HYPRLAND_INSTANCE_SIGNATURE"] = str(selected["instance"])
+            if not env.get("WAYLAND_DISPLAY") and selected.get("wl_socket"):
+                env["WAYLAND_DISPLAY"] = str(selected["wl_socket"])
+            return env
+
+    runtime_root = pathlib.Path(env["XDG_RUNTIME_DIR"]) / "hypr"
+    sockets = sorted(runtime_root.glob("*/.socket.sock"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if sockets:
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = sockets[0].parent.name
+    return env
+
+
+def lua_quote(value: str) -> str:
+    out = ['"']
+    for ch in value:
+        code = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif 32 <= code <= 126:
+            out.append(ch)
+        else:
+            out.append(f"\\{code:03d}")
+    out.append('"')
+    return "".join(out)
+
+
+def lua_plugin_dispatcher(dispatcher: str, payload: str) -> str | None:
+    mapping = {
+        "hypr-agent-portal:pointer": ("hypr_agent_portal", "pointer"),
+        "hypr-agent-portal:pointer-relative": ("hypr_agent_portal", "pointer_relative"),
+        "hypr-agent-portal:indicator": ("hypr_agent_portal", "indicator"),
+        "hypr-agent-portal:keyboard": ("hypr_agent_portal", "keyboard"),
+        "hypr-agent-portal:screenshot": ("hypr_agent_portal", "screenshot"),
+        "hypr-agent-portal:session": ("hypr_agent_portal", "session"),
+        "hypr-agent-portal:manage": ("hypr_agent_portal", "manage"),
+        "hypr-agent-portal:panic": ("hypr_agent_portal", "panic"),
+        "hypr-agent-portal:guard": ("hypr_agent_portal", "guard"),
+        "hypr-agent-portal:approval": ("hypr_agent_portal", "approval"),
+        "hypr-agent-protal:pointer": ("hypr_agent_protal", "pointer"),
+        "hypr-agent-protal:pointer-relative": ("hypr_agent_protal", "pointer_relative"),
+        "hypr-agent-protal:indicator": ("hypr_agent_protal", "indicator"),
+        "hypr-agent-protal:keyboard": ("hypr_agent_protal", "keyboard"),
+        "hypr-agent-protal:screenshot": ("hypr_agent_protal", "screenshot"),
+        "hypr-agent-protal:session": ("hypr_agent_protal", "session"),
+        "hypr-agent-protal:manage": ("hypr_agent_protal", "manage"),
+        "hypr-agent-protal:panic": ("hypr_agent_protal", "panic"),
+        "hypr-agent-protal:guard": ("hypr_agent_protal", "guard"),
+        "hypr-agent-protal:approval": ("hypr_agent_protal", "approval"),
+    }
+    target = mapping.get(dispatcher)
+    if not target:
+        return None
+    namespace, function = target
+    return f"hl.plugin.{namespace}.{function}({lua_quote(payload)})"
+
+
+def hyprland_config_provider() -> str | None:
+    result = hyprctl("systeminfo")
+    if result.returncode != 0:
+        return None
+    match = re.search(r"^configProvider:\s*(\S+)", result.stdout, re.MULTILINE)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def is_lua_config_provider() -> bool:
+    return hyprland_config_provider() == "lua"
+
+
+def dispatch(dispatcher: str, payload: str = "") -> subprocess.CompletedProcess:
+    if is_lua_config_provider():
+        lua_dispatcher = lua_plugin_dispatcher(dispatcher, payload)
+        if lua_dispatcher:
+            return subprocess.run(["hyprctl", "dispatch", lua_dispatcher], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False)
+        return subprocess.CompletedProcess(
+            ["hyprctl", "dispatch", dispatcher],
+            1,
+            "",
+            f"{dispatcher} cannot be dispatched through the legacy dispatcher syntax while Hyprland uses the Lua config provider\n",
+        )
+
+    args = ["hyprctl", "dispatch", dispatcher]
+    if payload:
+        args.append(payload)
+    return subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False)
+
+
+def hyprctl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["hyprctl", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False)
+
+
+def screenshot(args: argparse.Namespace) -> int:
+    root = state_root(args.output_dir)
+    session_path = root / f"session-{secrets.token_hex(16)}.json"
+
+    payload = str(session_path)
+    if args.target:
+        payload = ",".join([payload, args.target])
+    result = dispatch(args.dispatcher, payload)
+    if result.returncode != 0:
+        print(result.stderr or result.stdout, file=sys.stderr, end="")
+        return result.returncode or 1
+    if not session_path.exists():
+        print("screenshot session json was not written", file=sys.stderr)
+        return 1
+
+    provenance: dict | None = None
+    try:
+        session_fd = os.open(session_path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(session_fd, "r", encoding="utf-8") as stream:
+            session = json.load(stream)
+        provenance = _screenshot_provenance(root, session_path, None, session)
+        cursor_source = "none" if args.no_cursor else args.cursor_source
+        png, metadata = render_session_png(
+            session,
+            cursor_source=cursor_source,
+            cursor_path=root / "cursor.json",
+            model_resolution=args.model_resolution,
+            max_dimension=max(0, int(args.max_dimension or 0)),
+        )
+
+        png_path = _write_exclusive(root, session_path.with_suffix(".png").name, png)
+        provenance = _screenshot_provenance(root, session_path, png_path, session)
+        metadata.update({"sessionPath": str(session_path), "pngPath": str(png_path), "cleanupProvenance": provenance})
+
+        if args.base64:
+            metadata["pngBase64"] = base64.b64encode(png).decode("ascii")
+        print(json.dumps(metadata, ensure_ascii=False))
+        return 0
+    except Exception as exc:
+        if provenance is not None:
+            cleanup_screenshot_provenance(provenance)
+        else:
+            try:
+                session_path.unlink()
+            except FileNotFoundError:
+                pass
+        message = str(exc).replace(str(root), "<private-state>")
+        print(f"screenshot processing failed: {message}", file=sys.stderr)
+        return 1
+
+
+def pointer(args: argparse.Namespace) -> int:
+    payload = ",".join([args.target, str(args.x), str(args.y), args.action, args.button])
+    if args.action == "scroll" and args.dx is not None:
+        payload = ",".join([args.target, str(args.x), str(args.y), args.action, args.button, str(args.dx)])
+    elif args.action == "drag":
+        if args.x2 is None or args.y2 is None:
+            print("drag requires x2 and y2", file=sys.stderr)
+            return 2
+        payload = ",".join([args.target, str(args.x), str(args.y), args.action, args.button, str(args.x2), str(args.y2), str(max(0.0, min(args.duration, 3.0)))])
+    dispatcher = args.dispatcher
+    if args.relative and dispatcher == "hypr-agent-portal:pointer":
+        dispatcher = "hypr-agent-portal:pointer-relative"
+    result = dispatch(dispatcher, payload)
+    if result.returncode != 0:
+        print(result.stderr or result.stdout, file=sys.stderr, end="")
+        return result.returncode or 1
+    cursor_x = args.x2 if args.action == "drag" and args.x2 is not None else args.x
+    cursor_y = args.y2 if args.action == "drag" and args.y2 is not None else args.y
+    if args.relative:
+        global_cursor = window_relative_to_global(args.target, cursor_x, cursor_y)
+        if global_cursor is not None:
+            cursor_x, cursor_y = global_cursor
+    write_agent_cursor(cursor_state_path(), target=args.target, x=cursor_x, y=cursor_y, action=args.action, button=args.button)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "target": args.target,
+                    "x": args.x,
+                    "y": args.y,
+                    "x2": args.x2,
+                    "y2": args.y2,
+                    "action": args.action,
+                    "button": args.button,
+                    "duration": args.duration,
+                    "coordinateSpace": "window" if args.relative else "global",
+                    "cursorX": cursor_x,
+                    "cursorY": cursor_y,
+                }
+            )
+        )
+    else:
+        print(result.stdout, end="")
+    return 0
+
+
+def indicator(args: argparse.Namespace) -> int:
+    payload = ",".join([args.target, str(args.x), str(args.y), args.action])
+    result = dispatch(args.dispatcher, payload)
+    if result.returncode != 0:
+        print(result.stderr or result.stdout, file=sys.stderr, end="")
+        return result.returncode or 1
+    write_agent_cursor(cursor_state_path(), target=args.target, x=args.x, y=args.y, action=args.action, button="left")
+    if args.json:
+        print(json.dumps({"ok": True, "target": args.target, "x": args.x, "y": args.y, "action": args.action}))
+    else:
+        print(result.stdout, end="")
+    return 0
+
+
+def keyboard(args: argparse.Namespace) -> int:
+    parts = [args.target, args.action, args.key, args.modifiers or ""]
+    if args.x is not None or args.y is not None:
+        if args.x is None or args.y is None:
+            print("--x and --y must be passed together", file=sys.stderr)
+            return 2
+        parts.extend([str(args.x), str(args.y)])
+
+    result = dispatch(args.dispatcher, ",".join(parts))
+    if result.returncode != 0:
+        print(result.stderr or result.stdout, file=sys.stderr, end="")
+        return result.returncode or 1
+    if args.x is not None and args.y is not None:
+        write_agent_cursor(cursor_state_path(), target=args.target, x=args.x, y=args.y, action="key", button="left")
+    if args.json:
+        print(json.dumps({"ok": True, "target": args.target, "action": args.action, "key": args.key, "modifiers": args.modifiers or ""}))
+    else:
+        print(result.stdout, end="")
+    return 0
+
+
+def session(args: argparse.Namespace) -> int:
+    parts = [args.action]
+    if args.target:
+        parts.append(args.target)
+
+    result = dispatch(args.dispatcher, ",".join(parts))
+    if result.returncode != 0:
+        print(result.stderr or result.stdout, file=sys.stderr, end="")
+        return result.returncode or 1
+    if args.json:
+        print(json.dumps({"ok": True, "action": args.action, "target": args.target or ""}))
+    else:
+        print(result.stdout, end="")
+    return 0
+
+
+def manage(args: argparse.Namespace) -> int:
+    """Provider-aware bridge to the native identity-bound management gateway."""
+    result = dispatch(args.dispatcher, args.payload)
+    if result.returncode != 0:
+        print(result.stderr or result.stdout, file=sys.stderr, end="")
+        return result.returncode or 1
+    if args.json:
+        print(json.dumps({"ok": True, "dispatcher": args.dispatcher}))
+    return 0
+
+
+def panic(args: argparse.Namespace) -> int:
+    result = dispatch(args.dispatcher, args.action)
+    output = (result.stderr or result.stdout or "").strip()
+    panic_active = "hypr-agent-portal panic is active" in output.casefold()
+    if args.action == "status" and panic_active:
+        if args.json:
+            print(json.dumps({"ok": True, "action": args.action, "panicActive": True}))
+        else:
+            print("panic active")
+        return 0
+    if result.returncode != 0:
+        print(result.stderr or result.stdout, file=sys.stderr, end="")
+        return result.returncode or 1
+    if args.action == "cancel":
+        status = dispatch(args.dispatcher, "status")
+        status_output = (status.stderr or status.stdout or "").strip()
+        if status.returncode == 0:
+            panic_active = False
+        elif "hypr-agent-portal panic is active" in status_output.casefold():
+            panic_active = True
+        else:
+            print(status_output or "native panic status probe failed", file=sys.stderr)
+            return status.returncode or 1
+    else:
+        panic_active = args.action == "panic"
+    if args.json:
+        print(json.dumps({"ok": True, "action": args.action, "panicActive": panic_active}))
+    else:
+        print(result.stdout, end="")
+    return 0
+
+
+def guard(args: argparse.Namespace) -> int:
+    probes = {
+        "panic": "panicActive",
+        "locked": "screenLocked",
+        "exclusive-layer": "layerSurfaceActive",
+        "keyboard-grab": "keyboardGrabActive",
+    }
+    state: dict[str, bool | str] = {"available": True, "source": "native-plugin"}
+    for probe, field in probes.items():
+        result = dispatch(args.dispatcher, probe)
+        output = (result.stderr or result.stdout or "").strip()
+        marker = f"guard-active:{probe}"
+        if result.returncode == 0:
+            state[field] = False
+        elif marker in output.casefold():
+            state[field] = True
+        else:
+            print(output or f"native guard probe failed: {probe}", file=sys.stderr)
+            return result.returncode or 1
+    print(json.dumps(state, ensure_ascii=False))
+    return 0
+
+
+def windows(args: argparse.Namespace) -> int:
+    result = hyprctl("clients", "-j")
+    if result.returncode != 0:
+        print(result.stderr or result.stdout, file=sys.stderr, end="")
+        return result.returncode or 1
+
+    clients = json.loads(result.stdout or "[]")
+    for index, client in enumerate(clients):
+        if isinstance(client, dict):
+            client["hyprAgentPortalStackIndex"] = index
+            pid = str(client.get("pid") or "")
+            start_time = process_start_time(pid) if pid else ""
+            address = str(client.get("address") or "").lower()
+            if re.fullmatch(r"0x[0-9a-f]+", address) and pid.isdigit() and int(pid) > 0 and start_time.isdigit() and int(start_time) > 0:
+                client["processStartTime"] = start_time
+                client["target"] = f"address:{address}@pid={pid}@start={start_time}"
+    related_to = None
+    if args.related_to:
+        related_to = next((client for client in clients if selector_matches(client, args.related_to)), None)
+        if related_to is None:
+            print(f"related target not found: {args.related_to}", file=sys.stderr)
+            return 1
+
+    if args.visible_workspace:
+        active = hyprctl("activeworkspace", "-j")
+        workspace = None
+        if active.returncode == 0 and active.stdout.strip():
+            workspace = json.loads(active.stdout).get("id")
+        if workspace is not None:
+            clients = [c for c in clients if (c.get("workspace") or {}).get("id") == workspace]
+
+    if related_to is not None:
+        clients = [annotate_relation(client, related_to) for client in clients if is_related_window(client, related_to)]
+
+    print(json.dumps({"windows": clients}, ensure_ascii=False))
+    return 0
+
+
+def selector_matches(client: dict, selector: str) -> bool:
+    selector = selector.strip()
+    identity_match = re.fullmatch(
+        r"(?P<selector>address:0x[0-9a-fA-F]+)@pid=(?P<pid>[1-9][0-9]*)@start=(?P<start>[1-9][0-9]*)",
+        selector,
+    )
+    if selector.startswith("address:") and "@" in selector and identity_match is None:
+        return False
+    expected_pid = ""
+    expected_start = ""
+    if identity_match is not None:
+        selector = identity_match.group("selector")
+        expected_pid = identity_match.group("pid")
+        expected_start = identity_match.group("start")
+    if selector.startswith("address:"):
+        if str(client.get("address", "")).lower() != selector.split(":", 1)[1].lower():
+            return False
+        if expected_pid and str(client.get("pid") or "") != expected_pid:
+            return False
+        if expected_start and process_start_time(expected_pid) != expected_start:
+            return False
+        return True
+    haystack = "\n".join(str(client.get(key, "")) for key in ["address", "class", "title", "initialClass", "initialTitle"])
+    try:
+        return re.search(selector, haystack) is not None
+    except re.error:
+        return selector in haystack
+
+
+def process_start_time(pid: str | int) -> str:
+    try:
+        text = (pathlib.Path("/proc") / str(pid) / "stat").read_text()
+        remainder = text.rsplit(")", 1)[1].split()
+        return remainder[19] if len(remainder) > 19 else ""
+    except (OSError, IndexError, ValueError):
+        return ""
+
+
+def client_for_selector(selector: str) -> dict | None:
+    result = hyprctl("clients", "-j")
+    if result.returncode != 0:
+        return None
+    try:
+        clients = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    for client in clients:
+        if isinstance(client, dict) and selector_matches(client, selector):
+            return client
+    return None
+
+
+def window_relative_to_global(selector: str, x: float, y: float) -> tuple[float, float] | None:
+    client = client_for_selector(selector)
+    if client is None:
+        return None
+    at = client.get("at")
+    if not isinstance(at, list) or len(at) < 2:
+        return None
+    try:
+        return float(at[0]) + float(x), float(at[1]) + float(y)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_related_window(client: dict, target: dict) -> bool:
+    if client.get("address") == target.get("address"):
+        return True
+    if not client.get("mapped", True) or client.get("hidden", False):
+        return False
+    return bool(client.get("pid") and client.get("pid") == target.get("pid"))
+
+
+def annotate_relation(client: dict, target: dict) -> dict:
+    annotated = dict(client)
+    if client.get("address") == target.get("address"):
+        annotated["hyprAgentPortalRelation"] = "self"
+        return annotated
+
+    annotated["hyprAgentPortalRelation"] = "related"
+    tx, ty = target.get("at") or [0, 0]
+    tw, th = target.get("size") or [0, 0]
+    x, y = client.get("at") or [0, 0]
+    w, h = client.get("size") or [0, 0]
+    target_area = max(1.0, float(tw) * float(th))
+    area = max(1.0, float(w) * float(h))
+    if area < target_area * 0.6 and x >= tx - 64 and y >= ty - 64 and x <= tx + tw + 64 and y <= ty + th + 64:
+        annotated["hyprAgentPortalWindowKind"] = "popup"
+    else:
+        annotated["hyprAgentPortalWindowKind"] = "related"
+    return annotated
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="hypr-agent-portal command line bridge")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    shot = sub.add_parser("screenshot", help="capture a compositor screenshot session")
+    shot.add_argument("--dispatcher", default="hypr-agent-portal:screenshot")
+    shot.add_argument("--output-dir")
+    shot.add_argument("--target", help="optional Hyprland window selector for unoccluded target-window capture")
+    shot.add_argument("--base64", action="store_true")
+    shot.add_argument("--model-resolution", choices=["full", "logical"], default="full", help="full keeps HiDPI pixels; logical downsamples to compositor logical resolution")
+    shot.add_argument("--max-dimension", type=int, default=0, help="optional extra cap for the returned PNG longest edge; 0 disables this cap")
+    shot.add_argument("--no-cursor", action="store_true", help="do not draw the cursor indicator on the returned PNG")
+    shot.add_argument(
+        "--cursor-source",
+        choices=["auto", "agent", "hyprland", "none"],
+        default="none",
+        help="debug PNG cursor indicator source; auto prefers the last background pointer coordinate",
+    )
+    shot.set_defaults(func=screenshot)
+
+    ptr = sub.add_parser("pointer", help="send pointer input to a target window")
+    ptr.add_argument("target", help="Hyprland window regex, for example address:0x1234")
+    ptr.add_argument("x", type=float, help="global logical x coordinate, or window-relative x with --relative")
+    ptr.add_argument("y", type=float, help="global logical y coordinate, or window-relative y with --relative")
+    ptr.add_argument("action", choices=["move", "motion", "click", "doubleclick", "double-click", "press", "down", "release", "up", "scroll", "drag"])
+    ptr.add_argument("button", nargs="?", default="left", help="button name, or vertical wheel ticks for scroll")
+    ptr.add_argument("x2", nargs="?", type=float, help="destination global logical x coordinate for drag, or window-relative x with --relative")
+    ptr.add_argument("y2", nargs="?", type=float, help="destination global logical y coordinate for drag, or window-relative y with --relative")
+    ptr.add_argument("--dx", type=float, help="horizontal wheel ticks for scroll")
+    ptr.add_argument("--duration", type=float, default=0.2, help="drag pacing duration in seconds")
+    ptr.add_argument("--relative", action="store_true", help="interpret x/y and drag destination as window-relative logical coordinates")
+    ptr.add_argument("--dispatcher", default="hypr-agent-portal:pointer")
+    ptr.add_argument("--json", action="store_true")
+    ptr.set_defaults(func=pointer)
+
+    ind = sub.add_parser("indicator", help="show the agent cursor indicator without sending input")
+    ind.add_argument("target", help="Hyprland window regex, for example address:0x1234")
+    ind.add_argument("x", type=float, help="global logical x coordinate")
+    ind.add_argument("y", type=float, help="global logical y coordinate")
+    ind.add_argument("action", nargs="?", default="move", help="action label for cursor animation state")
+    ind.add_argument("--dispatcher", default="hypr-agent-portal:indicator")
+    ind.add_argument("--json", action="store_true")
+    ind.set_defaults(func=indicator)
+
+    key = sub.add_parser("keyboard", help="send keyboard input to a target window")
+    key.add_argument("target", help="Hyprland window regex, for example address:0x1234")
+    key.add_argument("action", choices=["tap", "press-release", "press", "down", "release", "up"])
+    key.add_argument("key", help="key name or raw evdev keycode, for example enter, v, f5, 28")
+    key.add_argument("modifiers", nargs="?", default="", help="optional modifiers, for example ctrl+shift")
+    key.add_argument("--x", type=float, help="optional global logical x coordinate to resolve a subsurface")
+    key.add_argument("--y", type=float, help="optional global logical y coordinate to resolve a subsurface")
+    key.add_argument("--dispatcher", default="hypr-agent-portal:keyboard")
+    key.add_argument("--json", action="store_true")
+    key.set_defaults(func=keyboard)
+
+    sess = sub.add_parser("session", help="begin, sync, or end a related-window workspace guard session")
+    sess.add_argument("action", choices=["begin", "sync", "end"])
+    sess.add_argument("target", nargs="?", help="Hyprland window regex, for example address:0x1234")
+    sess.add_argument("--dispatcher", default="hypr-agent-portal:session")
+    sess.add_argument("--json", action="store_true")
+    sess.set_defaults(func=session)
+
+    management = sub.add_parser("manage", help="invoke the identity-bound native window/workspace management gateway")
+    management.add_argument("payload", help="strict native manage payload")
+    management.add_argument("--dispatcher", default="hypr-agent-portal:manage")
+    management.add_argument("--json", action="store_true")
+    management.set_defaults(func=manage)
+
+    stop = sub.add_parser("panic", help="cancel agent activity, latch the panic stop, resume, or query panic state")
+    stop.add_argument("action", nargs="?", choices=["panic", "cancel", "resume", "status"], default="panic")
+    stop.add_argument("--dispatcher", default="hypr-agent-portal:panic")
+    stop.add_argument("--json", action="store_true")
+    stop.set_defaults(func=panic)
+
+    runtime_guard = sub.add_parser("guard", help="query native panic, lock, exclusive-layer, and keyboard-grab guards")
+    runtime_guard.add_argument("--dispatcher", default="hypr-agent-portal:guard")
+    runtime_guard.add_argument("--json", action="store_true", default=True)
+    runtime_guard.set_defaults(func=guard)
+
+    win = sub.add_parser("windows", help="list Hyprland windows")
+    win.add_argument("--visible-workspace", action="store_true", help="only return clients on the active workspace")
+    win.add_argument("--related-to", help="only return the selected window and same-process related windows")
+    win.set_defaults(func=windows)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -5,12 +5,12 @@ from types import SimpleNamespace
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-MCP = ROOT / "mcp" / "hypr-agent-protal-mcp.py"
+MCP = ROOT / "mcp" / "hypr-agent-portal-mcp.py"
 PLUGIN = ROOT / "src" / "plugin" / "main.cpp"
 
 
 def load_mcp():
-    spec = importlib.util.spec_from_file_location("hypr_agent_protal_mcp_keyboard", MCP)
+    spec = importlib.util.spec_from_file_location("hypr_agent_portal_mcp_keyboard", MCP)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -147,6 +147,43 @@ def test_plugin_focus_invariants() -> None:
     assert "input.keyboard.key.listen" in source
     assert "input.mouse.button.listen" in source
     assert "input.mouse.move.listen" in source
+
+    takeover_start = source.index("void handleHumanTakeover(")
+    takeover_end = source.index("void sendClipboardSelectionToNativeTarget", takeover_start)
+    takeover = source[takeover_start:takeover_end]
+    assert "if (pointerInput)" in takeover
+    assert "if (hadAsyncOperation)\n            cancelAsyncPointerOperation();" in takeover
+    assert "if (hadKeyboardLease)\n        restoreXWaylandKeyboardFocus();" in takeover
+    # Keyboard events call the handler with false, pointer events with true:
+    # only the pointer branch cancels an in-flight drag, while both reclaim an
+    # active XWayland keyboard lease.
+    assert "handleHumanTakeover(false)" in source
+    assert source.count("handleHumanTakeover(true)") >= 3
+
+    approval_start = source.index("SDispatchResult dispatchApproval(")
+    approval_end = source.index("SDispatchResult dispatchGuard(", approval_start)
+    approval = source[approval_start:approval_end]
+    assert 'action == "arm"' in approval
+    assert 'action == "status"' in approval
+    assert 'action == "cancel"' in approval
+    assert 'action == "approve"' not in approval
+    assert "validApprovalChallengeId" in approval
+    assert "ttlMs < 1000 || ttlMs > 120000" in approval
+    assert "never extends its" in approval
+    assert '"hypr-agent-portal:approval"' in source
+    assert '"hypr-agent-protal:approval"' in source
+    assert "case eLuaDispatcher::APPROVAL: return dispatchApproval(payload);" in source
+    assert "int luaApproval(lua_State* L)" in source
+    assert 'addLuaFunction(g_pluginHandle, name, "approval", luaApproval)' in source
+
+    physical_start = source.index("void handlePhysicalApprovalKey(")
+    physical_end = source.index("void sendClipboardSelectionToNativeTarget", physical_start)
+    physical = source[physical_start:physical_end]
+    assert "event.state != WL_KEYBOARD_KEY_STATE_PRESSED" in physical
+    assert "event.keycode != KEY_F12" in physical
+    assert "physicalApprovalKeyHeld()" in physical
+    assert "!keyboard->isVirtual()" in source
+    assert "handlePhysicalApprovalKey(event);" in source
 
 
 def main() -> int:

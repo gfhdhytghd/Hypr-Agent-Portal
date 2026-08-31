@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hypr-agent-portal"
+version = "0.4.0"
+description = "Hyprland background Computer Use MCP bridge"
+readme = "PYPI.md"
+requires-python = ">=3.10"
+authors = [{ name = "wilf" }]
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Desktop Environment :: Window Managers",
+]
+
+[project.urls]
+Homepage = "https://github.com/gfhdhytghd/Hypr-Agent-Portal"
+Repository = "https://github.com/gfhdhytghd/Hypr-Agent-Portal.git"
+Issues = "https://github.com/gfhdhytghd/Hypr-Agent-Portal/issues"
+
+[project.scripts]
+hypr-agent-portal = "hypr_agent_portal:main"
+
+[tool.setuptools]
+py-modules = ["hypr_agent_portal"]
+script-files = [
+  "mcp/hypr-agent-portal-mcp.py",
+  "mcp/hypr-agent-protal-mcp.py",
+  "mcp/action_sequence.py",
+  "mcp/compat_env.py",
+  "mcp/hypr_management.py",
+  "mcp/hypr_socket2.py",
+  "mcp/image_pipeline.py",
+  "mcp/ocr_backend.py",
+  "mcp/process_lease.py",
+  "mcp/security_audit.py",
+  "mcp/security_doctor.py",
+  "mcp/security_policy.py",
+  "mcp/target_identity.py",
+  "mcp/visual_targets.py",
+  "scripts/hypr-agent-portalctl",
+  "scripts/hypr-agent-protalctl",
+  "scripts/hypr-agent-portal-sandbox",
+  "scripts/install-codex-cursor-asset",
+]

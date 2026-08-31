@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.gfhdhytghd/hypr-agent-portal",
+  "title": "hypr-agent-portal",
+  "description": "Background screenshots and app control for Hyprland through MCP",
+  "repository": {
+    "url": "https://github.com/gfhdhytghd/Hypr-Agent-Portal",
+    "source": "github"
+  },
+  "version": "0.4.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "hypr-agent-portal",
+      "version": "0.4.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

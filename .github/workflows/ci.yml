@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install image test dependency
+        run: python -m pip install --disable-pip-version-check Pillow
+      - name: Compile Python entry points and tests
+        run: |
+          python -m py_compile \
+            scripts/hypr-agent-portalctl \
+            scripts/hypr-agent-protalctl \
+            scripts/hypr-agent-portal-sandbox \
+            scripts/install-codex-cursor-asset \
+            mcp/*.py \
+            tests/*.py
+      - name: Run Python tests
+        run: |
+          python tests/cursor_render.py
+          python tests/mcp_smoke.py mcp/hypr-agent-portal-mcp.py
+          python tests/mcp_smoke.py mcp/hypr-agent-protal-mcp.py
+          python tests/mcp_geometry.py
+          python tests/keyboard_routing.py
+          python tests/mcp_security.py
+          python tests/compat_env.py
+          python tests/process_lease.py
+          python tests/sandbox_runner.py
+          python tests/action_sequence.py
+          python tests/hypr_management.py
+          python tests/image_pipeline.py
+          python tests/ocr_backend.py
+          python tests/socket2_events.py
+          python tests/visual_targets.py
+          python tests/identity_binding.py
+          python tests/atspi_strict_resolver.py
+          python tests/secure_screenshot_storage.py
+      - name: Validate release metadata
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+          import re
+
+          expected = "0.4.0"
+          server = json.loads(pathlib.Path("server.json").read_text())
+          pyproject = pathlib.Path("pyproject.toml").read_text()
+          project_name = re.search(r'^name = "([^"]+)"$', pyproject, re.MULTILINE).group(1)
+          project_version = re.search(r'^version = "([^"]+)"$', pyproject, re.MULTILINE).group(1)
+          assert server["version"] == expected
+          assert server["packages"][0]["version"] == expected
+          assert project_version == expected
+          assert server["packages"][0]["identifier"] == project_name
+          PY
+
+  package:
+    name: Build Python package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check build twine
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - name: Smoke-test installed wheel
+        run: |
+          python -m venv /tmp/hypr-agent-portal-package-test
+          /tmp/hypr-agent-portal-package-test/bin/pip install --no-deps dist/*.whl
+          /tmp/hypr-agent-portal-package-test/bin/python \
+            tests/mcp_smoke.py \
+            /tmp/hypr-agent-portal-package-test/bin/hypr-agent-portal
+          /tmp/hypr-agent-portal-package-test/bin/python \
+            tests/mcp_smoke.py \
+            /tmp/hypr-agent-portal-package-test/bin/hypr-agent-protal-mcp.py
+      - name: Smoke-test user-installed wheel outside PATH
+        run: |
+          package_userbase=$(mktemp -d)
+          package_python=$(command -v python)
+          PYTHONUSERBASE="$package_userbase" \
+            "$package_python" -m pip install --user --no-deps --force-reinstall dist/*.whl
+          env \
+            PATH=/usr/bin:/bin \
+            PYTHONUSERBASE="$package_userbase" \
+            "$package_python" tests/mcp_smoke.py "$package_userbase/bin/hypr-agent-portal"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: python-package
+          path: dist/*
+          if-no-files-found: error
+
+  hyprland-plugin:
+    name: Hyprland plugin (${{ matrix.build-type }})
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: [Debug, Release]
+    steps:
+      - name: Install build dependencies
+        run: >-
+          pacman -Syu --noconfirm --needed
+          base-devel cmake ninja pkgconf python python-pillow
+          hyprland lua nlohmann-json
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify frozen Hyprland ABI
+        run: test "$(pkg-config --modversion hyprland)" = "0.56.2"
+      - name: Configure
+        run: cmake -S . -B build-ci -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build-type }}
+      - name: Build
+        run: cmake --build build-ci --parallel
+      - name: Test
+        run: ctest --test-dir build-ci --output-on-failure

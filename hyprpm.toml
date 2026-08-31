@@ -1,5 +1,5 @@
 [repository]
-name = "hypr-agent-protal"
+name = "hypr-agent-portal"
 authors = ["wilf"]
 commit_pins = [
     ["521ece463c4a9d3d128670688a34756805a4328f", "939823413e42ebc1f08315c1a530364762e1a1d2"],
@@ -7,8 +7,18 @@ commit_pins = [
     ["36b2e0cfe0c6094dbc47bd42a437431315bb3087", "7e894dac96f3802ff43073ccc2c306a95e03bf53"]
 ]
 
-["hypr-agent-protal"]
+["hypr-agent-portal"]
 description = "Background agent primitives for Hyprland"
+authors = ["wilf"]
+output = "build-hyprpm/libhypr-agent-portal.so"
+build = [
+    "cmake -S . -B build-hyprpm -DCMAKE_BUILD_TYPE=Release",
+    "cmake --build build-hyprpm",
+    "ctest --test-dir build-hyprpm --output-on-failure"
+]
+
+["hypr-agent-protal"]
+description = "Deprecated compatibility alias for hypr-agent-portal; do not enable both"
 authors = ["wilf"]
 output = "build-hyprpm/libhypr-agent-protal.so"
 build = [

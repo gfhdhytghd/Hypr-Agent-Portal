@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 import importlib.util
 import math
+import os
 import pathlib
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-MCP = ROOT / "mcp" / "hypr-agent-protal-mcp.py"
+MCP = ROOT / "mcp" / "hypr-agent-portal-mcp.py"
 
 
 def load_mcp():
-    spec = importlib.util.spec_from_file_location("hypr_agent_protal_mcp", MCP)
+    spec = importlib.util.spec_from_file_location("hypr_agent_portal_mcp", MCP)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -132,8 +133,8 @@ def main() -> int:
     try:
         moved_snapshot = {
             "app": {"name": "demo", "bundleIdentifier": "demo", "pid": 1},
-            "target": "address:0xmove",
-            "window": {"address": "0xmove", "class": "demo", "at": [10, 20], "size": [100, 80]},
+            "target": "address:0xa11",
+            "window": {"address": "0xa11", "pid": os.getpid(), "class": "demo", "at": [10, 20], "size": [100, 80]},
             "windowBounds": {"x": 10.0, "y": 20.0, "width": 100.0, "height": 80.0},
             "screenshot": {"width": 100, "height": 80, "logicalBounds": {"x": 10.0, "y": 20.0, "width": 100.0, "height": 80.0}},
             "elements": [{"index": 3, "source": "atspi", "controlType": "push button", "name": "OK", "frame": {"x": 20.0, "y": 10.0, "width": 20.0, "height": 20.0}}],
@@ -143,7 +144,7 @@ def main() -> int:
         }
         mcp.SNAPSHOTS.clear()
         mcp.SNAPSHOTS["demo"] = moved_snapshot
-        mcp.list_hypr_windows = lambda: [{"address": "0xmove", "class": "demo", "at": [45, 60], "size": [100, 80], "mapped": True, "hidden": False}]
+        mcp.list_hypr_windows = lambda: [{"address": "0xa11", "pid": os.getpid(), "class": "demo", "at": [45, 60], "size": [100, 80], "mapped": True, "hidden": False}]
         shifted = mcp.current_snapshot("demo")
         near(shifted["screenshot"]["logicalBounds"]["x"], 45.0)
         near(shifted["screenshot"]["logicalBounds"]["y"], 60.0)
@@ -152,8 +153,8 @@ def main() -> int:
 
         resized_snapshot = {
             **moved_snapshot,
-            "target": "address:0xresize",
-            "window": {"address": "0xresize", "class": "demo", "at": [10, 20], "size": [100, 80]},
+            "target": "address:0xb22",
+            "window": {"address": "0xb22", "pid": os.getpid(), "class": "demo", "at": [10, 20], "size": [100, 80]},
             "windowBounds": {"x": 10.0, "y": 20.0, "width": 100.0, "height": 80.0},
             "elements": [
                 {
@@ -169,8 +170,8 @@ def main() -> int:
         }
         rebuilt_snapshot = {
             **resized_snapshot,
-            "target": "address:0xresize",
-            "window": {"address": "0xresize", "class": "demo", "at": [10, 20], "size": [180, 120]},
+            "target": "address:0xb22",
+            "window": {"address": "0xb22", "pid": os.getpid(), "class": "demo", "at": [10, 20], "size": [180, 120]},
             "windowBounds": {"x": 10.0, "y": 20.0, "width": 180.0, "height": 120.0},
             "screenshot": {"width": 180, "height": 120, "logicalBounds": {"x": 10.0, "y": 20.0, "width": 180.0, "height": 120.0}},
             "elements": [
@@ -188,7 +189,7 @@ def main() -> int:
         }
         mcp.SNAPSHOTS.clear()
         mcp.SNAPSHOTS["demo"] = resized_snapshot
-        mcp.list_hypr_windows = lambda: [{"address": "0xresize", "class": "demo", "at": [10, 20], "size": [180, 120], "mapped": True, "hidden": False}]
+        mcp.list_hypr_windows = lambda: [{"address": "0xb22", "pid": os.getpid(), "class": "demo", "at": [10, 20], "size": [180, 120], "mapped": True, "hidden": False}]
         mcp.build_app_snapshot = lambda app: rebuilt_snapshot
         element_snapshot, element, refresh = mcp.element_snapshot_for_action("demo", "3")
         assert element_snapshot is rebuilt_snapshot
@@ -204,11 +205,11 @@ def main() -> int:
     original_related_windows_for = mcp.related_windows_for
     try:
         mcp.related_windows_for = lambda target: [
-            {"address": "0x1", "hyprAgentProtalRelation": "self", "class": "libreoffice-calc", "mapped": True, "hidden": False},
+            {"address": "0x1", "hyprAgentPortalRelation": "self", "class": "libreoffice-calc", "mapped": True, "hidden": False},
             {
                 "address": "0x2",
-                "hyprAgentProtalRelation": "related",
-                "hyprAgentProtalWindowKind": "related",
+                "hyprAgentPortalRelation": "related",
+                "hyprAgentPortalWindowKind": "related",
                 "class": "libreoffice-calc",
                 "mapped": True,
                 "hidden": False,
@@ -216,8 +217,8 @@ def main() -> int:
             },
             {
                 "address": "0x3",
-                "hyprAgentProtalRelation": "related",
-                "hyprAgentProtalWindowKind": "related",
+                "hyprAgentPortalRelation": "related",
+                "hyprAgentPortalWindowKind": "related",
                 "class": "soffice",
                 "mapped": True,
                 "hidden": False,
@@ -227,8 +228,13 @@ def main() -> int:
         related = mcp.related_popups_for("address:0x1")
         assert [item["address"] for item in related] == ["0x3"]
         selected, meta = mcp.prefer_related_target("address:0x1")
-        assert selected == "address:0x3"
-        assert meta and meta["address"] == "0x3"
+        assert selected == "address:0x1" and meta is None
+        try:
+            mcp.prefer_related_target("address:0x1", True)
+        except RuntimeError as exc:
+            assert "target the popup explicitly" in str(exc)
+        else:
+            raise AssertionError("automatic related-window rerouting remained enabled")
         active = mcp.active_related_windows(mcp.related_windows_for("address:0x1"))
         assert [item["address"] for item in active] == ["0x3"]
     finally:
@@ -319,10 +325,10 @@ def main() -> int:
     assert "ACTIVE RELATED POPUP DETECTED:" in rendered_popup
     assert "address:0xpopup" in rendered_popup
     delta = mcp.window_delta(
-        [{"address": "0xroot", "title": "Root", "hyprAgentProtalRelation": "self"}],
+        [{"address": "0xroot", "title": "Root", "hyprAgentPortalRelation": "self"}],
         [
-            {"address": "0xroot", "title": "Root", "hyprAgentProtalRelation": "self"},
-            {"address": "0xpopup", "title": "Dialog", "hyprAgentProtalWindowKind": "popup", "hyprAgentProtalRelation": "related"},
+            {"address": "0xroot", "title": "Root", "hyprAgentPortalRelation": "self"},
+            {"address": "0xpopup", "title": "Dialog", "hyprAgentPortalWindowKind": "popup", "hyprAgentPortalRelation": "related"},
         ],
     )
     assert delta["opened"][0]["target"] == "address:0xpopup"
@@ -330,6 +336,7 @@ def main() -> int:
     assert "opened address:0xpopup" in mcp.render_snapshot_text(action_delta_snapshot)
     original_build_app_snapshot = mcp.build_app_snapshot
     original_list_hypr_windows = mcp.list_hypr_windows
+    original_resolve_hypr_window = mcp.resolve_hypr_window
     try:
         before_popup = {
             "target": "address:0xpopup",
@@ -337,8 +344,8 @@ def main() -> int:
             "relatedWindows": [
                 {
                     "address": "0xroot",
-                    "hyprAgentProtalRelation": "related",
-                    "hyprAgentProtalWindowKind": "related",
+                    "hyprAgentPortalRelation": "related",
+                    "hyprAgentPortalWindowKind": "related",
                     "mapped": True,
                     "hidden": False,
                     "floating": False,
@@ -352,7 +359,7 @@ def main() -> int:
             assert app == "address:0xroot"
             return {
                 "app": {"name": "root", "bundleIdentifier": "root", "pid": 1234},
-                "window": {"address": "0xroot", "class": "root", "workspace": {"name": "1"}, "xwayland": False},
+                "window": {"address": "0xroot", "class": "root", "workspace": {"name": "1"}, "pid": 1234, "processStartTime": "5678", "xwayland": False},
                 "target": "address:0xroot",
                 "windowTitle": "Root",
                 "treeLines": [],
@@ -362,6 +369,7 @@ def main() -> int:
 
         mcp.build_app_snapshot = fake_build_app_snapshot
         mcp.list_hypr_windows = lambda: []
+        mcp.resolve_hypr_window = lambda app: {"address": "0xroot", "class": "root", "workspace": {"name": "1"}, "pid": 1234, "processStartTime": "5678"}
         after_closed = mcp.snapshot_after_action("address:0xpopup", before_popup)
         assert after_closed["target"] == "address:0xroot"
         assert after_closed["lastAction"]["targetClosed"] is True
@@ -371,10 +379,11 @@ def main() -> int:
     finally:
         mcp.build_app_snapshot = original_build_app_snapshot
         mcp.list_hypr_windows = original_list_hypr_windows
+        mcp.resolve_hypr_window = original_resolve_hypr_window
     original_wait_window_candidates = mcp.wait_window_candidates
     original_build_app_snapshot = mcp.build_app_snapshot
     try:
-        mcp.wait_window_candidates = lambda args: [{"address": "0xwait", "title": "Dialog", "hyprAgentProtalWindowKind": "popup"}]
+        mcp.wait_window_candidates = lambda args: [{"address": "0xwait", "title": "Dialog", "hyprAgentPortalWindowKind": "popup"}]
         mcp.build_app_snapshot = lambda app: {
             "app": {"name": "wait", "bundleIdentifier": "wait", "pid": 1},
             "window": {"address": "0xwait", "class": "wait", "workspace": {"name": "1"}, "xwayland": False},

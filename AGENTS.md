@@ -1,6 +1,6 @@
-# hypr-agent-protal Agent Notes
+# hypr-agent-portal Agent Notes
 
-When a task says to use `hypr-agent-protal`, use the `hypr-agent-protal` MCP tools, not Browser MCP, shell GUI automation, or the obsolete `hyprcum` namespace.
+When a task says to use `hypr-agent-portal`, use the `hypr-agent-portal` MCP tools, not Browser MCP, shell GUI automation, or the obsolete `hyprcum` namespace.
 
 For browser/app-control tasks:
 
@@ -18,5 +18,6 @@ For browser/app-control tasks:
 10. Read `uiHints` before acting on menus, tabs, or toolbars. `controlType=menu` is a toolkit role and may be a classic menu, command label, or ribbon/notebookbar page selector; verify the current screenshot/app state instead of assuming the visual meaning.
 11. If `get_app_state` exposes `globalMenu` actions, use `activate_menu_item` with the returned `menu_index` for app-menu commands. If no global menu item is exposed, use visible elements or screenshot/window-relative coordinates.
 12. Do not invent app-specific shortcuts or search-result heuristics; refresh `get_app_state` and act on visible elements or screenshot/window-relative coordinates.
+13. Honor structured security denials and dry-run results. Do not retry through a lower-level alias to bypass policy. For `confirmation_required`, request a token only for the exact proposed call and then use it once without changing the arguments. `panic` with `panic` or `cancel` remains available as the emergency stop path, including in read-only mode.
 
-Do not switch to Browser MCP just because the target app is a browser; `hypr-agent-protal` controls Chromium through Hyprland background screenshots, AT-SPI app state, and background input.
+Do not switch to Browser MCP just because the target app is a browser; `hypr-agent-portal` controls Chromium through Hyprland background screenshots, AT-SPI app state, and background input.

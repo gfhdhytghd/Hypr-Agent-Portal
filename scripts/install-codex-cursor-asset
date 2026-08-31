@@ -19,8 +19,8 @@ DEFAULT_OPEN_CODEX_REFERENCE = Path(
 def default_output_dir() -> Path:
     xdg_config = os.environ.get("XDG_CONFIG_HOME")
     if xdg_config:
-        return Path(xdg_config) / "hypr-agent-protal"
-    return Path.home() / ".config" / "hypr-agent-protal"
+        return Path(xdg_config) / "hypr-agent-portal"
+    return Path.home() / ".config" / "hypr-agent-portal"
 
 
 def candidate_sources() -> list[Path]:
@@ -63,7 +63,7 @@ def premultiplied_rgba_bytes(png_path: Path) -> bytes:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Install the Codex Computer Use cursor texture for hypr-agent-protal.")
+    parser = argparse.ArgumentParser(description="Install the Codex Computer Use cursor texture for hypr-agent-portal.")
     parser.add_argument("source", nargs="?", type=Path, help="official 252x252 cursor PNG to install")
     parser.add_argument("--output-dir", type=Path, default=default_output_dir())
     args = parser.parse_args()
@@ -86,7 +86,7 @@ def main() -> int:
     print(f"source={source}")
     print(f"raw={raw_path}")
     print(f"png={png_copy}")
-    print("hypr-agent-protal will use the raw texture after the plugin is reloaded.")
+    print("hypr-agent-portal will use the raw texture after the plugin is reloaded.")
     return 0
 
 

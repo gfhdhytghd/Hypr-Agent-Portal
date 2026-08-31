@@ -8,8 +8,8 @@ import tempfile
 
 def load_ctl():
     repo = pathlib.Path(__file__).resolve().parents[1]
-    path = repo / "scripts" / "hypr-agent-protalctl"
-    loader = importlib.machinery.SourceFileLoader("hypr_agent_protalctl", str(path))
+    path = repo / "scripts" / "hypr-agent-portalctl"
+    loader = importlib.machinery.SourceFileLoader("hypr_agent_portalctl", str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -22,6 +22,7 @@ def main() -> int:
         tmp = pathlib.Path(tmpdir)
         artifact = tmp / "monitor.rgba"
         artifact.write_bytes(bytes([240, 240, 240, 255]) * 100)
+        artifact.chmod(0o600)
         session = {
             "cursorPosition": {"x": 4.0, "y": 5.0},
             "windows": [],
@@ -44,6 +45,7 @@ def main() -> int:
         assert metadata["cursorIndicator"]["pixelPosition"] == {"x": 4, "y": 5}
 
         (tmp / "cursor.json").write_text(json.dumps({"x": 8, "y": 9, "target": "address:0x1"}))
+        (tmp / "cursor.json").chmod(0o600)
         _, metadata = ctl.render_session_png(session, cursor_source="auto", cursor_path=tmp / "cursor.json")
         assert metadata["cursorIndicator"]["visible"] is True
         assert metadata["cursorIndicator"]["source"] == "agent"
@@ -63,6 +65,7 @@ def main() -> int:
 
         hidpi_artifact = tmp / "hidpi.rgba"
         hidpi_artifact.write_bytes(bytes([200, 200, 200, 255]) * 400)
+        hidpi_artifact.chmod(0o600)
         hidpi_session = {
             "cursorPosition": {"x": 4.0, "y": 5.0},
             "windows": [],

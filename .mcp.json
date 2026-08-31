@@ -1,9 +1,9 @@
 {
   "mcpServers": {
-    "hypr-agent-protal": {
+    "hypr-agent-portal": {
       "type": "stdio",
       "command": "python3",
-      "args": ["mcp/hypr-agent-protal-mcp.py"],
+      "args": ["mcp/hypr-agent-portal-mcp.py"],
       "cwd": "."
     }
   }

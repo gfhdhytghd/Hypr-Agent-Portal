@@ -22,7 +22,7 @@ def main() -> int:
                     "params": {
                         "protocolVersion": "2025-06-18",
                         "capabilities": {},
-                        "clientInfo": {"name": "hypr-agent-protal-smoke", "version": "0"},
+                        "clientInfo": {"name": "hypr-agent-portal-smoke", "version": "0"},
                     },
                 }
             ),
@@ -45,7 +45,7 @@ def main() -> int:
         return proc.returncode or 1
 
     lines = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
-    assert lines[0]["result"]["serverInfo"]["name"] == "hypr-agent-protal"
+    assert lines[0]["result"]["serverInfo"]["name"] == "hypr-agent-portal"
     tools = lines[1]["result"]["tools"]
     tools_by_name = {tool["name"]: tool for tool in tools}
     expected_tools = {
@@ -81,12 +81,29 @@ def main() -> int:
         "wait",
         "wait_for_window",
         "wait_for_close",
+        "security_status",
+        "request_confirmation",
+        "panic",
+        "audit_replay",
+        "ocr",
+        "click_text",
+        "get_marks",
+        "click_mark",
+        "type_into",
+        "sequence",
+        "manage_window",
+        "list_workspaces",
+        "manage_workspace",
     }
     assert set(tools_by_name) == expected_tools
-    assert lines[0]["result"]["serverInfo"]["version"] == "0.3.47"
+    assert lines[0]["result"]["serverInfo"]["version"] == "0.4.0"
     actions = set(tools_by_name["computer"]["inputSchema"]["properties"]["action"]["enum"])
-    for action in ["screenshot", "windows", "click", "scroll", "drag", "key", "type", "paste_image", "session", "get_app_state", "read_app_state", "wait", "wait_for_window", "wait_for_close", "doctor", "launch", "launch_app", "open_app", "get_cursor_position", "activate_menu_item", "left_click", "left_click_drag", "hover"]:
+    for action in ["screenshot", "windows", "click", "scroll", "drag", "key", "type", "paste_image", "session", "get_app_state", "read_app_state", "wait", "wait_for_window", "wait_for_close", "doctor", "launch", "launch_app", "open_app", "get_cursor_position", "activate_menu_item", "left_click", "left_click_drag", "hover", "ocr", "click_text", "get_marks", "click_mark", "type_into", "sequence", "manage_window", "list_workspaces", "manage_workspace"]:
         assert action in actions
+    assert tools_by_name["ocr"]["inputSchema"]["properties"]["backend"]["default"] == "auto"
+    assert tools_by_name["click_text"]["inputSchema"]["properties"]["match"]["enum"] == ["exact", "contains"]
+    assert tools_by_name["get_marks"]["inputSchema"]["properties"]["zoom"]["maximum"] == 8
+    assert tools_by_name["sequence"]["inputSchema"]["properties"]["steps"]["maxItems"] == 128
     assert tools_by_name["launch_app"]["inputSchema"]["properties"]["url"]["type"] == "string"
     assert tools_by_name["launch_app"]["inputSchema"]["properties"]["new_window"]["default"] is True
     assert tools_by_name["launch_app"]["inputSchema"]["properties"]["reuse_existing"]["default"] is True
@@ -103,9 +120,10 @@ def main() -> int:
     assert "keys" in tools_by_name["computer"]["inputSchema"]["properties"]["method"]["enum"]
     assert "atspi" in tools_by_name["type_text"]["inputSchema"]["properties"]["method"]["enum"]
     assert tools_by_name["paste_text"]["inputSchema"]["required"] == ["app", "text"]
-    assert tools_by_name["paste_text"]["inputSchema"]["properties"]["restore_clipboard"]["default"] is True
+    assert tools_by_name["paste_text"]["inputSchema"]["properties"]["restore_clipboard"]["default"] is False
     assert tools_by_name["computer"]["inputSchema"]["properties"]["prefer_related"]["type"] == "boolean"
     assert tools_by_name["computer"]["inputSchema"]["properties"]["restore_clipboard"]["type"] == "boolean"
+    assert tools_by_name["computer"]["inputSchema"]["properties"]["restore_clipboard"]["default"] is False
     assert tools_by_name["computer"]["inputSchema"]["properties"]["restore_delay"]["default"] == 1.0
     assert tools_by_name["computer"]["inputSchema"]["properties"]["related_to"]["type"] == "string"
     assert "begin" in tools_by_name["computer"]["inputSchema"]["properties"]["session_action"]["enum"]
@@ -134,6 +152,10 @@ def main() -> int:
     assert tools_by_name["wait_for_window"]["inputSchema"]["properties"]["timeout"]["maximum"] == 30
     assert tools_by_name["wait_for_close"]["inputSchema"]["properties"]["related_to"]["type"] == "string"
     assert tools_by_name["wait_for_close"]["inputSchema"]["properties"]["timeout"]["maximum"] == 30
+    assert tools_by_name["security_status"]["annotations"]["readOnlyHint"] is True
+    for name in ("request_confirmation", "panic", "audit_replay"):
+        assert tools_by_name[name]["annotations"]["destructiveHint"] is True
+        assert "confirmation_token" in tools_by_name[name]["inputSchema"]["properties"]
     return 0
 
 

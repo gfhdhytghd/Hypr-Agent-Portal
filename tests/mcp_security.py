@@ -2130,8 +2130,8 @@ def test_mcp_wait_backend_does_not_leak_unselected_privacy_event() -> None:
         "address": "0xabc",
         "class": "org.example.Allowed",
         "title": "Allowed",
-        "pid": 42,
-        "processStartTime": "123",
+        "pid": os.getpid(),
+        "processStartTime": module.process_start_time(os.getpid()),
     }
     calls = 0
 

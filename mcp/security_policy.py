@@ -255,6 +255,8 @@ class ConfinementConfig:
 
 @dataclass(frozen=True)
 class PolicyConfig:
+    # Enforcement is opt-in so a stock portal remains directly usable.
+    enabled: bool = False
     readonly: bool = False
     dry_run: bool = False
     confinement: ConfinementConfig = field(default_factory=ConfinementConfig)
@@ -824,6 +826,7 @@ class SecurityPolicy:
         with self._lock:
             lease = self._current_lease_locked()
             return {
+                "enabled": self.config.enabled,
                 "readonly": self.config.readonly,
                 "dryRun": self.config.dry_run,
                 "defaultAuthorization": self.config.default_authorization.name.lower(),
@@ -955,6 +958,9 @@ class SecurityPolicy:
     ) -> PolicyDecision:
         guards = guards or GuardInputs()
         target = request.target
+
+        if not self.config.enabled:
+            return PolicyDecision(True, True, DecisionCode.ALLOW, "security policy enforcement is disabled")
 
         if target is not None and self.privacy_excluded(target):
             return self._deny(DecisionCode.PRIVACY_EXCLUDED, "target application is excluded by privacy policy")
@@ -1329,6 +1335,7 @@ def policy_config_from_env(env: Mapping[str, str] | None = None) -> PolicyConfig
         match=ScopeMatch(values.get(prefix + "CONFINE_MATCH", ScopeMatch.ANY.value).strip().lower()),
     )
     return PolicyConfig(
+        enabled=_env_bool(values, prefix + "ENABLED", False),
         readonly=_env_bool(values, prefix + "READONLY", False),
         dry_run=_env_bool(values, prefix + "DRY_RUN", False),
         confinement=confinement,

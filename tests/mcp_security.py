@@ -47,8 +47,10 @@ def load_path(path: pathlib.Path, stem: str) -> Any:
 @contextlib.contextmanager
 def security_environment(**values: str | None) -> Iterator[None]:
     prefix = "HYPR_AGENT_PORTAL_"
+    if "SECURITY_ENABLED" not in values:
+        values["SECURITY_ENABLED"] = "1"
     # Integration tests exercise mutation plumbing explicitly. Production's
-    # unconfigured default remains VIEW and is covered by the policy test.
+    # unconfigured policy is disabled and is covered by the default test.
     if "SECURITY_DEFAULT_AUTHORIZATION" not in values:
         values["SECURITY_DEFAULT_AUTHORIZATION"] = "full"
     previous = {key: value for key, value in os.environ.items() if key.startswith(prefix)}
@@ -80,6 +82,7 @@ def audit_module() -> Any:
 
 def make_policy(mod: Any, **overrides: Any) -> Any:
     values = {
+        "enabled": True,
         "default_authorization": mod.AuthorizationLevel.FULL,
         "mutation_lease_required": False,
         "human_takeover_enabled": False,
@@ -179,6 +182,21 @@ def test_policy_readonly_and_dry_run() -> None:
     assert decision.to_dict()["execute"] is False
 
 
+def test_policy_is_disabled_by_default_and_can_be_enabled() -> None:
+    mod = policy_module()
+    full_request = request(mod, required_level=mod.AuthorizationLevel.FULL)
+
+    default_policy = mod.SecurityPolicy(mod.PolicyConfig())
+    decision = default_policy.evaluate(full_request)
+    assert decision.allowed is True
+    assert decision.execute is True
+    assert default_policy.state()["enabled"] is False
+
+    enabled_policy = mod.SecurityPolicy(mod.PolicyConfig(enabled=True))
+    assert_denied(enabled_policy.evaluate(full_request), mod.DecisionCode.APP_PERMISSION)
+    assert enabled_policy.state()["enabled"] is True
+
+
 def test_policy_confinement() -> None:
     mod = policy_module()
     confined = make_policy(
@@ -276,6 +294,7 @@ def test_mcp_panic_latches_all_mutation_paths_until_resume() -> None:
         module = load_path(MCP, "mcp_panic_latch")
     module.SECURITY_POLICY = module.SecurityPolicy(
         type(module.SECURITY_POLICY.config)(
+            enabled=True,
             default_authorization=module.AuthorizationLevel.FULL,
             mutation_lease_required=False,
             human_takeover_enabled=False,
@@ -333,7 +352,7 @@ def test_policy_detects_known_lock_processes_without_real_procfs() -> None:
             process.mkdir()
             (process / "comm").write_text(name, encoding="utf-8")
         policy = mod.SecurityPolicy(
-            mod.PolicyConfig(mutation_lease_required=False, human_takeover_enabled=False),
+            mod.PolicyConfig(enabled=True, mutation_lease_required=False, human_takeover_enabled=False),
             proc_root=proc_root,
         )
         assert policy.detect_lock_screen() == ("hyprlock",)
@@ -342,7 +361,7 @@ def test_policy_detects_known_lock_processes_without_real_procfs() -> None:
 def test_policy_application_authorization_and_privacy() -> None:
     mod = policy_module()
     default_policy = mod.SecurityPolicy(
-        mod.PolicyConfig(mutation_lease_required=False, human_takeover_enabled=False)
+        mod.PolicyConfig(enabled=True, mutation_lease_required=False, human_takeover_enabled=False)
     )
     assert default_policy.config.default_authorization == mod.AuthorizationLevel.VIEW
     assert_denied(default_policy.evaluate(request(mod)), mod.DecisionCode.APP_PERMISSION)
@@ -426,6 +445,7 @@ def test_policy_mutation_lease_is_single_owner_and_expires() -> None:
     now = [100.0]
     policy = mod.SecurityPolicy(
         mod.PolicyConfig(
+            enabled=True,
             default_authorization=mod.AuthorizationLevel.FULL,
             mutation_lease_required=True,
             human_takeover_enabled=False,
@@ -454,6 +474,7 @@ def test_policy_confirmation_tokens_are_bound_and_one_time() -> None:
         confirmation_dir = pathlib.Path(temporary) / "confirmations"
         policy = mod.SecurityPolicy(
             mod.PolicyConfig(
+                enabled=True,
                 default_authorization=mod.AuthorizationLevel.FULL,
                 mutation_lease_required=False,
                 human_takeover_enabled=False,
@@ -522,6 +543,7 @@ def test_confirmation_waits_for_native_physical_proof() -> None:
         confirmation_dir = pathlib.Path(temporary) / "confirmations"
         policy = mod.SecurityPolicy(
             mod.PolicyConfig(
+                enabled=True,
                 default_authorization=mod.AuthorizationLevel.FULL,
                 mutation_lease_required=False,
                 human_takeover_enabled=False,
@@ -586,6 +608,7 @@ def test_confirmation_capacity_expiry_rate_and_symlink_safety() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         confirmation_dir = pathlib.Path(temporary) / "confirmations"
         config = mod.PolicyConfig(
+            enabled=True,
             default_authorization=mod.AuthorizationLevel.FULL,
             mutation_lease_required=False,
             human_takeover_enabled=False,
@@ -618,6 +641,7 @@ def test_confirmation_capacity_expiry_rate_and_symlink_safety() -> None:
         rate_dir = pathlib.Path(temporary) / "rate-confirmations"
         rate_policy = mod.SecurityPolicy(
             mod.PolicyConfig(
+                enabled=True,
                 default_authorization=mod.AuthorizationLevel.FULL,
                 mutation_lease_required=False,
                 human_takeover_enabled=False,
@@ -650,6 +674,7 @@ def test_confirmation_capacity_expiry_rate_and_symlink_safety() -> None:
         confirmation_dir = pathlib.Path(temporary) / "confirmations"
         policy = mod.SecurityPolicy(
             mod.PolicyConfig(
+                enabled=True,
                 default_authorization=mod.AuthorizationLevel.FULL,
                 mutation_lease_required=False,
                 human_takeover_enabled=False,
@@ -678,6 +703,7 @@ def test_confirmation_capacity_is_atomic_across_policy_instances() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         confirmation_dir = pathlib.Path(temporary) / "confirmations"
         config = mod.PolicyConfig(
+            enabled=True,
             default_authorization=mod.AuthorizationLevel.FULL,
             mutation_lease_required=False,
             human_takeover_enabled=False,
@@ -710,6 +736,7 @@ def test_forged_approved_file_requires_live_native_proof() -> None:
         confirmation_dir = pathlib.Path(temporary) / "confirmations"
         policy = mod.SecurityPolicy(
             mod.PolicyConfig(
+                enabled=True,
                 default_authorization=mod.AuthorizationLevel.FULL,
                 mutation_lease_required=False,
                 human_takeover_enabled=False,
@@ -865,6 +892,7 @@ def test_policy_human_takeover_cooldown() -> None:
     now = [300.0]
     policy = mod.SecurityPolicy(
         mod.PolicyConfig(
+            enabled=True,
             default_authorization=mod.AuthorizationLevel.FULL,
             mutation_lease_required=False,
             human_takeover_enabled=True,
@@ -899,6 +927,7 @@ def test_policy_environment_contract() -> None:
     ):
         policy = mod.policy_from_env()
     config = policy.config
+    assert config.enabled is True
     assert config.readonly is True
     assert config.dry_run is True
     assert "org.example.safe" in config.confinement.classes
@@ -2343,6 +2372,7 @@ def test_mcp_workspace_semantics_match_direct_and_computer_handlers() -> None:
 
 
 TESTS = [
+    test_policy_is_disabled_by_default_and_can_be_enabled,
     test_policy_readonly_and_dry_run,
     test_policy_confinement,
     test_policy_lock_layer_and_keyboard_grab_guards,

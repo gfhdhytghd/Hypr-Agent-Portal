@@ -263,24 +263,30 @@ The MCP server exposes the compatibility tool `computer` plus Codex-style app-st
 ### Safety policy
 
 Every direct mutating tool and every mutating `computer` action passes through
-the same policy gate before any compositor or clipboard operation. Useful
+the same policy gate before any compositor or clipboard operation when the
+security policy is enabled. Policy enforcement is disabled by default; opt in
+with `HYPR_AGENT_PORTAL_SECURITY_ENABLED=1`. Useful
 launch profiles include:
 
 ```sh
 # Observation only: mutating tools are hidden and computer exposes only reads.
-HYPR_AGENT_PORTAL_READONLY=1 python3 mcp/hypr-agent-portal-mcp.py
+HYPR_AGENT_PORTAL_SECURITY_ENABLED=1 HYPR_AGENT_PORTAL_READONLY=1 \
+  python3 mcp/hypr-agent-portal-mcp.py
 
 # Validate calls and return structured decisions without executing mutations.
-HYPR_AGENT_PORTAL_DRYRUN=1 python3 mcp/hypr-agent-portal-mcp.py
+HYPR_AGENT_PORTAL_SECURITY_ENABLED=1 HYPR_AGENT_PORTAL_DRYRUN=1 \
+  python3 mcp/hypr-agent-portal-mcp.py
 
 # Restrict mutations to launched windows, Firefox classes, or workspace 3.
-HYPR_AGENT_PORTAL_CONFINE='launched,class:firefox*,workspace:3' \
+HYPR_AGENT_PORTAL_SECURITY_ENABLED=1 \
+  HYPR_AGENT_PORTAL_CONFINE='launched,class:firefox*,workspace:3' \
   python3 mcp/hypr-agent-portal-mcp.py
 ```
 
 The long-form `HYPR_AGENT_PORTAL_SECURITY_*` variables are the canonical
 configuration surface. Common settings are:
 
+- `ENABLED=1` opts into security policy enforcement. It defaults to disabled.
 - `DEFAULT_AUTHORIZATION=view|click|full` and
   `APP_AUTHORIZATIONS='firefox*=full,org.keepassxc.KeePassXC=view'`.
 - `CLIPBOARD_PERMISSIONS='write,paste_text,paste_file,paste_image'`.

@@ -78,34 +78,8 @@ if(HYPRLAND_SOURCE_DIR)
   )
 endif()
 
-foreach(HYPRLAND_INCLUDE_DIR ${HYPR_DEPS_INCLUDE_DIRS})
-  foreach(HYPRLAND_DERIVED_INCLUDE_DIR
-      "${HYPRLAND_INCLUDE_DIR}/hyprland/src"
-      "${HYPRLAND_INCLUDE_DIR}/hyprland/protocols"
-      "${HYPRLAND_INCLUDE_DIR}/src"
-      "${HYPRLAND_INCLUDE_DIR}/protocols")
-    if(EXISTS "${HYPRLAND_DERIVED_INCLUDE_DIR}")
-      list(APPEND HYPR_DEPS_INCLUDE_DIRS "${HYPRLAND_DERIVED_INCLUDE_DIR}")
-    endif()
-  endforeach()
-endforeach()
-
-if(NOT HYPRLAND_SOURCE_DIR)
-  set(HYPRLAND_FOUND_PLUGIN_API FALSE)
-  foreach(HYPRLAND_INCLUDE_DIR ${HYPR_DEPS_INCLUDE_DIRS})
-    if(EXISTS "${HYPRLAND_INCLUDE_DIR}/hyprland/src/plugins/PluginAPI.hpp")
-      set(HYPRLAND_FOUND_PLUGIN_API TRUE)
-    endif()
-  endforeach()
-  if(NOT HYPRLAND_FOUND_PLUGIN_API AND EXISTS "/usr/include/hyprland/src/plugins/PluginAPI.hpp")
-    list(APPEND HYPR_DEPS_INCLUDE_DIRS
-      /usr/include
-      /usr/include/hyprland
-      /usr/include/hyprland/src
-      /usr/include/hyprland/protocols
-    )
-  endif()
-endif()
+# Keep Hyprland include paths from pkg-config; deriving them from dependency
+# roots such as /usr/include can mix system and target Hyprland headers.
 list(REMOVE_DUPLICATES HYPR_DEPS_INCLUDE_DIRS)
 
 add_library(hypr_agent_portal SHARED

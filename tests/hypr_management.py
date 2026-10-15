@@ -483,9 +483,10 @@ class HyprManagementTests(unittest.TestCase):
         block = source.split("SDispatchResult dispatchManage", 1)[1].split("SDispatchResult dispatchPanic", 1)[0]
         self.assertIn("!identity.valid || !identity.qualified", block)
         self.assertIn("const PHLWINDOW window = resolveTargetWindow(parts[1]);", block)
-        self.assertIn("window->m_isMapped", block)
-        self.assertIn("runBuiltinDispatcher", block)
-        self.assertNotIn("runBuiltinDispatcher(parts[0]", block)
+        self.assertIn("window->mapped()", block)
+        self.assertIn("Config::Actions::focus(window)", block)
+        self.assertIn("Config::Actions::moveToWorkspace(parts[2], !follow, window)", block)
+        self.assertNotIn("runBuiltinDispatcher", block)
         self.assertIn('"hypr-agent-portal:manage", dispatchManage', source)
         self.assertIn('"hypr-agent-protal:manage", dispatchManage', source)
         self.assertIn('addLuaFunction(g_pluginHandle, name, "manage", luaManage)', source)

@@ -1,22 +1,23 @@
 #include "plugin/screenshot_capture.hpp"
 
 #include <hyprland/src/config/ConfigManager.hpp>
-#include <hyprland/src/config/lua/bindings/LuaBindingsInternal.hpp>
 #include <hyprland/src/config/shared/actions/ConfigActions.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/config/values/ConfigValues.hpp>
 
 #define private public
 #include <hyprland/src/Compositor.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprland/src/desktop/state/GlobalWindowController.hpp>
 #include <hyprland/src/desktop/state/ViewState.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/config/lua/bindings/LuaBindingsInternal.hpp>
+#include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
-#include <hyprland/src/managers/KeybindManager.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
@@ -32,6 +33,8 @@
 #include <hyprland/src/xwayland/XSurface.hpp>
 #include <hyprland/src/xwayland/XWayland.hpp>
 #undef private
+
+#include "plugin/window_backend.hpp"
 
 extern "C" {
 #include <lauxlib.h>
@@ -162,34 +165,7 @@ bool registerConfigValue(SP<Config::Values::IValue> value) {
     return HyprlandAPI::addConfigValueV2(g_pluginHandle, std::move(value));
 }
 
-bool usingLegacyConfig() {
-    return Config::mgr() && Config::mgr()->type() == Config::CONFIG_LEGACY;
-}
-
-template <typename T>
-T legacyConfigValue(const std::string& name, T fallback) {
-    const auto value = HyprlandAPI::getConfigValue(g_pluginHandle, name);
-    if (!value)
-        return fallback;
-
-    try {
-        return std::any_cast<T>(value->getValue());
-    } catch (const std::bad_any_cast&) {
-        return fallback;
-    }
-}
-
-template <typename T>
-T legacyCompatConfigValue(const std::string& suffix, T fallback) {
-    const auto current = legacyConfigValue<T>("plugin:hypr-agent-portal:" + suffix, fallback);
-    const auto compat = legacyConfigValue<T>("plugin:hypr-agent-protal:" + suffix, fallback);
-    return current != fallback ? current : compat;
-}
-
 bool configBool(const std::string& suffix, bool fallback) {
-    if (usingLegacyConfig())
-        return legacyCompatConfigValue<Hyprlang::INT>(suffix, fallback ? 1 : 0) != 0;
-
     const auto aliased = [fallback](const auto& current, const auto& compat) {
         const bool currentValue = current ? current->value() : fallback;
         const bool compatValue = compat ? static_cast<bool>(compat->value()) : fallback;
@@ -212,9 +188,6 @@ bool configBool(const std::string& suffix, bool fallback) {
 }
 
 int configInt(const std::string& suffix, int fallback) {
-    if (usingLegacyConfig())
-        return static_cast<int>(legacyCompatConfigValue<Hyprlang::INT>(suffix, fallback));
-
     const auto aliased = [fallback](const auto& current, const auto& compat) {
         const int currentValue = current ? static_cast<int>(current->value()) : fallback;
         return currentValue != fallback ? currentValue : (compat ? static_cast<int>(compat->value()) : currentValue);
@@ -228,24 +201,6 @@ int configInt(const std::string& suffix, int fallback) {
 }
 
 std::string configString(const std::string& suffix, const std::string& fallback) {
-    if (usingLegacyConfig()) {
-        const auto read = [&suffix](const std::string& prefix) -> std::string {
-            const auto value = HyprlandAPI::getConfigValue(g_pluginHandle, prefix + suffix);
-            if (!value)
-                return {};
-            try {
-                return std::string{std::any_cast<Hyprlang::STRING>(value->getValue())};
-            } catch (const std::bad_any_cast&) {
-                return {};
-            }
-        };
-        const auto current = read("plugin:hypr-agent-portal:");
-        const auto compat = read("plugin:hypr-agent-protal:");
-        if (suffix == "privacy_class_denylist" && !current.empty() && !compat.empty())
-            return current + "," + compat;
-        return !current.empty() ? current : (!compat.empty() ? compat : fallback);
-    }
-
     if (suffix == "cursor_texture_path" && g_config.cursorTexturePath) {
         const std::string current = g_config.cursorTexturePath->value();
         if (current != fallback || !g_config.compatCursorTexturePath)
@@ -264,24 +219,6 @@ std::string configString(const std::string& suffix, const std::string& fallback)
 }
 
 void registerPluginConfig() {
-    if (usingLegacyConfig()) {
-        const auto addBoth = [](const std::string& suffix, const auto& value) {
-            HyprlandAPI::addConfigValue(g_pluginHandle, "plugin:hypr-agent-portal:" + suffix, value);
-            HyprlandAPI::addConfigValue(g_pluginHandle, "plugin:hypr-agent-protal:" + suffix, value);
-        };
-        addBoth("allow_pointer", Hyprlang::INT{1});
-        addBoth("allow_keyboard", Hyprlang::INT{1});
-        addBoth("allow_screenshot", Hyprlang::INT{1});
-        addBoth("allow_session", Hyprlang::INT{1});
-        addBoth("show_indicator", Hyprlang::INT{1});
-        addBoth("indicator_timeout_ms", Hyprlang::INT{30000});
-        addBoth("keyboard_restore_delay_ms", Hyprlang::INT{700});
-        addBoth("cancel_on_human_input", Hyprlang::INT{1});
-        addBoth("cursor_texture_path", Hyprlang::STRING{""});
-        addBoth("privacy_class_denylist", Hyprlang::STRING{""});
-        return;
-    }
-
     using namespace Config::Values;
 
     g_config.allowPointer          = makeShared<CBoolValue>(LUA_CONFIG_ALLOW_POINTER, "allow background pointer dispatchers", true);
@@ -378,9 +315,9 @@ CBox agentIndicatorRenderedWindowBox(const PHLWINDOW& window) {
         return {};
 
     auto box = window->getFullWindowBoundingBox();
-    if (window->m_workspace && !window->m_pinned)
+    if (window->m_workspace && !static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED))
         box.translate(window->m_workspace->m_renderOffset->value());
-    box.translate(window->m_floatingOffset);
+    box.translate(window->presentation().floatingOffset());
     return box;
 }
 
@@ -800,17 +737,18 @@ Vector2D animatedAgentPosition(const Time::steady_tp& now, const PHLWINDOW& wind
     return cubicPoint(start, bezier.control1, bezier.control2, target, progress);
 }
 
-void renderAgentIndicator(eRenderStage stage) {
-    if (stage != RENDER_POST_WINDOW || !configBool("show_indicator", true) || (!g_agentPointerPosition && !g_agentPointerRelativePosition) || !g_agentPointerUpdated ||
+void renderAgentIndicator(const Event::SRenderStageEvent& event) {
+    if (event.stage != RENDER_POST_WINDOW || !event.context || !configBool("show_indicator", true) || (!g_agentPointerPosition && !g_agentPointerRelativePosition) || !g_agentPointerUpdated ||
         !g_pHyprOpenGL || !g_pHyprRenderer)
         return;
 
+    auto&      ctx = event.context->get();
     const auto targetWindow = g_agentPointerWindow.lock();
-    const auto currentWindow = g_pHyprRenderer->m_renderData.currentWindow.lock();
+    const auto currentWindow = ctx.m_data.currentWindow.lock();
     if (!targetWindow || currentWindow != targetWindow)
         return;
 
-    const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto monitor = ctx.m_data.pMonitor.lock();
     if (!monitor)
         return;
 
@@ -853,7 +791,7 @@ void renderAgentIndicator(eRenderStage stage) {
     data.tex = texture;
     data.box = CBox{x, y, renderSize, renderSize};
     data.a = static_cast<float>(fade);
-    g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(std::move(data)));
+    g_pHyprRenderer->addPassElement(ctx, makeUnique<CTexPassElement>(std::move(data)));
 }
 
 void stopIndicatorTimer(SP<CEventLoopTimer>& timer) {
@@ -1258,7 +1196,7 @@ bool compositorSessionLocked() {
 }
 
 bool exclusiveLayerSurfaceActive() {
-    return g_pInputManager && std::ranges::any_of(g_pInputManager->m_exclusiveLSes, [](const auto& layer) { return static_cast<bool>(layer.lock()); });
+    return g_pInputManager && std::ranges::any_of(g_pInputManager->m_exclusiveKeyboardLSes, [](const auto& layer) { return static_cast<bool>(layer.lock()); });
 }
 
 bool keyboardGrabActive() {
@@ -1279,8 +1217,8 @@ bool screenshotPrivacyDenied(const PHLWINDOW& window) {
     if (!window)
         return false;
 
-    const auto windowClass = lower(trim(window->m_class));
-    const auto initialClass = lower(trim(window->m_initialClass));
+    const auto windowClass = lower(trim(window->metadata().appID()));
+    const auto initialClass = lower(trim(window->metadata().initialAppID()));
     for (const auto& denied : splitCsv(configString("privacy_class_denylist", ""))) {
         const auto normalized = lower(trim(denied));
         if (!normalized.empty() &&
@@ -1306,21 +1244,21 @@ CBox windowMainSurfaceGoalBox(const PHLWINDOW& window) {
 }
 
 bool sameXWaylandClientFamily(const PHLWINDOW& root, const PHLWINDOW& candidate) {
-    if (!root || !candidate || root == candidate || !root->m_isX11 || !candidate->m_isX11)
+    if (!root || !candidate || root == candidate || !root->backend().isX11() || !candidate->backend().isX11())
         return false;
 
-    const auto transientFor = candidate->x11Parent();
+    const auto transientFor = hypr_agent_portal::x11ParentWindow(candidate);
     if (transientFor && transientFor == root)
         return true;
 
-    const auto rootPid = root->getPID();
-    const auto candidatePid = candidate->getPID();
+    const auto rootPid = root->backend().pid();
+    const auto candidatePid = candidate->backend().pid();
     if (rootPid <= 0 || candidatePid != rootPid)
         return false;
 
-    if (!root->m_class.empty() && root->m_class == candidate->m_class)
+    if (!root->metadata().appID().empty() && root->metadata().appID() == candidate->metadata().appID())
         return true;
-    return !root->m_initialClass.empty() && root->m_initialClass == candidate->m_initialClass;
+    return !root->metadata().initialAppID().empty() && root->metadata().initialAppID() == candidate->metadata().initialAppID();
 }
 
 bool sameClientFamily(const PHLWINDOW& root, const PHLWINDOW& candidate) {
@@ -1329,20 +1267,20 @@ bool sameClientFamily(const PHLWINDOW& root, const PHLWINDOW& candidate) {
     if (sameXWaylandClientFamily(root, candidate))
         return true;
 
-    const auto rootPid = root->getPID();
-    const auto candidatePid = candidate->getPID();
+    const auto rootPid = root->backend().pid();
+    const auto candidatePid = candidate->backend().pid();
     return rootPid > 0 && candidatePid == rootPid;
 }
 
 PHLWINDOW xwaylandRelatedWindowAt(const PHLWINDOW& root, const Vector2D& globalPos) {
-    if (!g_pCompositor || !root || !root->m_isX11)
+    if (!g_pCompositor || !root || !root->backend().isX11())
         return root;
 
     PHLWINDOW best = root;
     double    bestArea = std::numeric_limits<double>::infinity();
 
     for (const auto& candidate : Desktop::windowState()->windows()) {
-        if (!candidate || !candidate->m_isMapped || candidate->isHidden() || !sameXWaylandClientFamily(root, candidate))
+        if (!candidate || !candidate->mapped() || candidate->isHidden() || !sameXWaylandClientFamily(root, candidate))
             continue;
 
         const auto box = windowMainSurfaceGoalBox(candidate);
@@ -1367,7 +1305,7 @@ PHLWORKSPACE workspaceSessionTarget(const WorkspaceSession& session) {
 }
 
 bool workspaceSessionMatchesWindow(const WorkspaceSession& session, const PHLWINDOW& window, bool requireMapped = true) {
-    if (!window || (requireMapped && !window->m_isMapped))
+    if (!window || (requireMapped && !window->mapped()))
         return false;
 
     const auto root = session.root.lock();
@@ -1375,15 +1313,16 @@ bool workspaceSessionMatchesWindow(const WorkspaceSession& session, const PHLWIN
         return true;
     if (root && sameClientFamily(root, window))
         return true;
-    return session.pid > 0 && window->getPID() == session.pid;
+    return session.pid > 0 && window->backend().pid() == session.pid;
 }
 
 void constrainRelatedWindowFocusAndLayer(const PHLWINDOW& window) {
     if (!window)
         return;
 
-    window->m_noInitialFocus = true;
-    window->m_suppressedEvents |= Desktop::View::SUPPRESS_ACTIVATE | Desktop::View::SUPPRESS_ACTIVATE_FOCUSONLY;
+    window->m_state |= Desktop::View::WINDOW_STATE_NO_INITIAL_FOCUS;
+    window->m_requestSuppression.activate = true;
+    window->m_requestSuppression.activateFocusOnly = true;
 }
 
 void restackRelatedWindowWithRoot(const PHLWINDOW& root, const PHLWINDOW& window) {
@@ -1409,11 +1348,11 @@ void placeRelatedWindowOnRootWorkspaceEarly(WorkspaceSession& session, const PHL
         return;
 
     constrainRelatedWindowFocusAndLayer(window);
-    if (!window->m_isMapped)
+    if (!window->mapped())
         return;
 
     const auto targetWorkspace = workspaceSessionTarget(session);
-    if (!targetWorkspace || targetWorkspace->inert() || window->m_workspace == targetWorkspace)
+    if (!targetWorkspace || !targetWorkspace->space() || window->m_workspace == targetWorkspace)
         return;
 
     window->moveToWorkspace(targetWorkspace);
@@ -1451,7 +1390,7 @@ void scheduleRelatedWindowRestacks(const PHLWINDOW& root, const PHLWINDOW& windo
 }
 
 void moveRelatedWindowToSessionWorkspace(WorkspaceSession& session, const PHLWINDOW& window) {
-    if (!g_pCompositor || !window || !window->m_isMapped)
+    if (!g_pCompositor || !window || !window->mapped())
         return;
 
     const auto root = session.root.lock();
@@ -1459,7 +1398,7 @@ void moveRelatedWindowToSessionWorkspace(WorkspaceSession& session, const PHLWIN
         return;
 
     const auto targetWorkspace = workspaceSessionTarget(session);
-    if (!targetWorkspace || targetWorkspace->inert())
+    if (!targetWorkspace || !targetWorkspace->space())
         return;
 
     if (window->m_workspace != targetWorkspace)
@@ -1570,10 +1509,10 @@ PHLWINDOW resolveTargetWindow(const std::string& rawSelector) {
     auto window = Desktop::viewState()->query().selector(identity.selector).mappedOnly().runWindow();
     // Keep the compositor-owned strong reference while validating the process
     // identity, so an address cannot be recycled between lookup and use.
-    if (!window || !window->m_isMapped)
+    if (!window || !window->mapped())
         return {};
     if (identity.qualified) {
-        if (window->getPID() != identity.pid)
+        if (window->backend().pid() != identity.pid)
             return {};
         const auto actualStartTime = processStartTimeForPid(identity.pid);
         if (!actualStartTime || *actualStartTime != identity.processStartTime)
@@ -1587,18 +1526,18 @@ std::optional<TargetSurface> resolveTargetSurface(const std::string& targetRegex
         return std::nullopt;
 
     auto window = resolveTargetWindow(targetRegex);
-    if (!window || !window->m_isMapped)
+    if (!window || !window->mapped())
         return std::nullopt;
 
     window = xwaylandRelatedWindowAt(window, globalPos);
 
-    if (window->m_isX11) {
+    if (window->backend().isX11()) {
         if (!window->wlSurface() || !window->wlSurface()->resource())
             return std::nullopt;
 
         const auto mainBox = windowMainSurfaceGoalBox(window);
         Vector2D   local = globalPos - mainBox.pos();
-        const auto scale = window->m_X11SurfaceScaledBy <= 0.0F ? 1.0F : window->m_X11SurfaceScaledBy;
+        const auto scale = window->backend().surfaceScale() <= 0.0F ? 1.0F : window->backend().surfaceScale();
         local = local * scale;
         return TargetSurface{.window = window, .surface = window->wlSurface()->resource(), .local = local};
     }
@@ -1624,7 +1563,7 @@ std::optional<Vector2D> targetPointToGlobal(const std::string& targetRegex, cons
         return std::nullopt;
 
     const auto window = resolveTargetWindow(targetRegex);
-    if (!window || !window->m_isMapped)
+    if (!window || !window->mapped())
         return std::nullopt;
 
     const auto box = windowMainSurfaceGoalBox(window);
@@ -1643,7 +1582,7 @@ std::optional<TargetSurface> resolveTargetMainSurface(const std::string& targetR
         return std::nullopt;
 
     const auto window = resolveTargetWindow(targetRegex);
-    if (!window || !window->m_isMapped || !window->wlSurface() || !window->wlSurface()->resource())
+    if (!window || !window->mapped() || !window->wlSurface() || !window->wlSurface()->resource())
         return std::nullopt;
 
     const auto mainBox = windowMainSurfaceGoalBox(window);
@@ -1716,7 +1655,7 @@ struct PointerFocusRestore {
         if (!g_pSeatManager)
             return;
 
-        if (target.window && target.window->m_isX11) {
+        if (target.window && target.window->backend().isX11()) {
             restoreLater(std::chrono::milliseconds(75), true);
             return;
         }
@@ -1927,10 +1866,12 @@ void restoreXWaylandKeyboardFocus() {
 }
 
 bool activateXWaylandKeyboardTarget(const TargetSurface& target) {
-    if (!target.window || !target.window->m_isX11 || !target.window->m_xwaylandSurface || !g_pXWayland || !g_pXWayland->m_wm)
+    if (!target.window || !target.window->backend().isX11() || !g_pXWayland || !g_pXWayland->m_wm)
         return false;
 
-    const auto xTarget = target.window->m_xwaylandSurface;
+    const auto xTarget = g_pXWayland->m_wm->windowForXID(target.window->backend().clientID().id);
+    if (!xTarget)
+        return false;
     if (g_xwaylandKeyboardLease.active) {
         cancelXWaylandKeyboardRestoreTimer();
         if (g_pXWayland->m_wm->m_focusedSurface.lock() != xTarget) {
@@ -1997,7 +1938,7 @@ void finishAsyncPointerOperation(const std::shared_ptr<AsyncPointerOperation>& o
             }
             g_pSeatManager->sendPointerFrame();
 
-            if (target.window && target.window->m_isX11) {
+            if (target.window && target.window->backend().isX11()) {
                 g_pSeatManager->m_state.pointerFocus.reset();
                 g_pSeatManager->m_state.pointerFocusResource.reset();
             }
@@ -2092,7 +2033,7 @@ void handlePhysicalApprovalKey(const IKeyboard::SKeyEvent& event) {
 }
 
 void sendClipboardSelectionToNativeTarget(const TargetSurface& target) {
-    if (!target.surface || (target.window && target.window->m_isX11) || !PROTO::data || !g_pSeatManager)
+    if (!target.surface || (target.window && target.window->backend().isX11()) || !PROTO::data || !g_pSeatManager)
         return;
 
     const auto selection = g_pSeatManager->m_selection.currentSelection.lock();
@@ -2260,7 +2201,7 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
                         g_pSeatManager->sendPointerFrame();
                         showAgentIndicator(target.window, state->lastGlobal, "drag");
 
-                        if (target.window && target.window->m_isX11) {
+                        if (target.window && target.window->backend().isX11()) {
                             g_pSeatManager->m_state.pointerFocus.reset();
                             g_pSeatManager->m_state.pointerFocusResource.reset();
                         }
@@ -2304,7 +2245,7 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
         g_pSeatManager->sendPointerButton(nowMs(), *button, WL_POINTER_BUTTON_STATE_PRESSED);
         g_pSeatManager->sendPointerButton(nowMs(), *button, WL_POINTER_BUTTON_STATE_RELEASED);
         g_pSeatManager->sendPointerFrame();
-        restore.restoreLater(std::chrono::milliseconds(120), target->window && target->window->m_isX11);
+        restore.restoreLater(std::chrono::milliseconds(120), target->window && target->window->backend().isX11());
         return {.success = true};
     }
 
@@ -2365,7 +2306,7 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
                 }
 
                 if (g_pSeatManager) {
-                    if (target && target->window && target->window->m_isX11) {
+                    if (target && target->window && target->window->backend().isX11()) {
                         g_pSeatManager->m_state.pointerFocus.reset();
                         g_pSeatManager->m_state.pointerFocusResource.reset();
                     }
@@ -2425,7 +2366,7 @@ SDispatchResult dispatchIndicator(const std::string& args) {
         return {.success = false, .error = "indicator coordinates must be finite numbers"};
 
     auto window = resolveTargetWindow(parts[0]);
-    if (!window || !window->m_isMapped)
+    if (!window || !window->mapped())
         return {.success = false, .error = "target window not found"};
 
     const Vector2D global{*x, *y};
@@ -2560,7 +2501,7 @@ SDispatchResult dispatchScreenshot(const std::string& args) {
     PHLWINDOW  targetWindow;
     if (!target.empty()) {
         const auto window = resolveTargetWindow(target);
-        if (!window || !window->m_isMapped)
+        if (!window || !window->mapped())
             return {.success = false, .error = "target window not found"};
         if (screenshotPrivacyDenied(window))
             return {.success = false, .error = "target window class is excluded by privacy_class_denylist"};
@@ -2570,7 +2511,7 @@ SDispatchResult dispatchScreenshot(const std::string& args) {
         // hidden windows and windows on inactive workspaces. Apply privacy to
         // that exact superset, not only to windows visible in monitor pixels.
         const bool privateMappedWindow = std::ranges::any_of(Desktop::windowState()->windows(), [](const auto& window) {
-            return window && window->m_isMapped && screenshotPrivacyDenied(window);
+            return window && window->mapped() && screenshotPrivacyDenied(window);
         });
         if (privateMappedWindow)
             return {.success = false,
@@ -2602,14 +2543,14 @@ SDispatchResult dispatchSession(const std::string& args) {
             return {.success = false, .error = "session begin requires a target window selector"};
 
         const auto root = resolveTargetWindow(parts[1]);
-        if (!root || !root->m_isMapped)
+        if (!root || !root->mapped())
             return {.success = false, .error = "target window not found"};
 
         auto existing = std::find_if(g_workspaceSessions.begin(), g_workspaceSessions.end(), [&root](const auto& session) { return session.root.lock() == root; });
         if (existing == g_workspaceSessions.end()) {
             g_workspaceSessions.push_back({
                 .root = PHLWINDOWREF{root},
-                .pid = root->getPID(),
+                .pid = root->backend().pid(),
                 .targetWorkspace = root->m_workspace,
             });
             existing = std::prev(g_workspaceSessions.end());
@@ -2684,15 +2625,6 @@ bool validManageWorkspace(const std::string& selector) {
     return id.has_value();
 }
 
-SDispatchResult runBuiltinDispatcher(const std::string_view name, const std::string& payload) {
-    if (!g_pKeybindManager)
-        return {.success = false, .error = "Hyprland keybind manager is unavailable"};
-    const auto dispatcher = g_pKeybindManager->m_dispatchers.find(std::string{name});
-    if (dispatcher == g_pKeybindManager->m_dispatchers.end())
-        return {.success = false, .error = "required Hyprland dispatcher is unavailable"};
-    return dispatcher->second(payload);
-}
-
 SDispatchResult manageActionResult(Config::Actions::ActionResult result) {
     if (!result)
         return {.success = false, .error = result.error().message};
@@ -2702,7 +2634,7 @@ SDispatchResult manageActionResult(Config::Actions::ActionResult result) {
 PHLWORKSPACE resolveManageWorkspace(const std::string& selector) {
     if (!State::workspaceState())
         return {};
-    return State::workspaceState()->query().string(selector).run();
+    return State::workspaceState()->query().input(selector).run();
 }
 
 bool validManageWorkspaceName(const std::string& name) {
@@ -2715,7 +2647,7 @@ SDispatchResult dispatchWorkspaceManage(const std::string& action, const std::ve
         if (parts.size() != 3 || !validManageWorkspace(parts[1]) || parts[1].starts_with("special") || !validManageWorkspaceName(parts[2]))
             return {.success = false, .error = "workspace_rename requires an existing ordinary workspace and a safe new name"};
         const PHLWORKSPACE workspace = resolveManageWorkspace(parts[1]);
-        if (!workspace || workspace->inert() || workspace->m_isSpecialWorkspace)
+        if (!workspace || !workspace->space() || workspace->type() == Workspace::eWorkspaceType::SPECIAL)
             return {.success = false, .error = "workspace_rename target is stale or not found"};
         return manageActionResult(Config::Actions::renameWorkspace(workspace, parts[2]));
     }
@@ -2750,12 +2682,12 @@ SDispatchResult dispatchWorkspaceManage(const std::string& action, const std::ve
             if (action == "special_show" || action == "special_toggle")
                 return workspace ? SDispatchResult{.success = true} : SDispatchResult{.success = false, .error = "special workspace creation was not observable"};
         }
-        if (!workspace || workspace->inert() || !workspace->m_isSpecialWorkspace)
+        if (!workspace || !workspace->space() || workspace->type() != Workspace::eWorkspaceType::SPECIAL)
             return {.success = false, .error = "special workspace target is stale or invalid"};
 
         std::vector<PHLMONITOR> visibleOn;
         for (const auto& monitor : State::monitorState()->monitors()) {
-            if (monitor && monitor->activeSpecialWorkspaceID() == workspace->m_id)
+            if (monitor && monitor->m_activeSpecialWorkspace == workspace)
                 visibleOn.push_back(monitor);
         }
         const bool hide = action == "special_hide" || (action == "special_toggle" && !visibleOn.empty());
@@ -2773,10 +2705,10 @@ SDispatchResult dispatchWorkspaceManage(const std::string& action, const std::ve
 }
 
 // A deliberately narrow management gateway.  The caller cannot name a
-// Hyprland dispatcher: every action below maps to a compile-time allowlist.
+// Hyprland dispatcher: every action below maps to a typed action.
 // resolveTargetWindow returns a compositor-owned strong reference and checks
 // pid plus /proc starttime, so the address cannot be recycled between lookup
-// and the synchronous built-in dispatcher call in this compositor stack frame.
+// and the synchronous typed action call in this compositor stack frame.
 SDispatchResult dispatchManage(const std::string& args) {
     if (g_agentPanicActive)
         return {.success = false, .error = "hypr-agent-portal panic is active"};
@@ -2814,27 +2746,24 @@ SDispatchResult dispatchManage(const std::string& args) {
             return std::nullopt;
         return SDispatchResult{.success = false, .error = "invalid argument count for management action"};
     };
-    const auto runForWindow = [&window, &identity](std::string_view dispatcher, const std::string& payload) -> SDispatchResult {
-        if (!window->m_isMapped)
-            return {.success = false, .error = "qualified management target became unmapped"};
-        return runBuiltinDispatcher(dispatcher, payload.empty() ? identity.selector : payload);
-    };
+    if (!window->mapped())
+        return {.success = false, .error = "qualified management target became unmapped"};
 
     if (action == "focus" || action == "close" || action == "floating" || action == "tiled" || action == "pin" || action == "unpin") {
         if (const auto error = requireCount(2); error)
             return *error;
         if (action == "focus")
-            return runForWindow("focuswindow", "");
+            return manageActionResult(Config::Actions::focus(window));
         if (action == "close")
-            return runForWindow("closewindow", "");
+            return manageActionResult(Config::Actions::closeWindow(window));
         if (action == "floating")
-            return runForWindow("setfloating", "");
+            return manageActionResult(Config::Actions::floatWindow(Config::Actions::TOGGLE_ACTION_ENABLE, window));
         if (action == "tiled")
-            return runForWindow("settiled", "");
+            return manageActionResult(Config::Actions::floatWindow(Config::Actions::TOGGLE_ACTION_DISABLE, window));
         const bool desired = action == "pin";
-        if (window->m_pinned == desired)
+        if (static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED) == desired)
             return {.success = true};
-        return runForWindow("pin", "");
+        return manageActionResult(Config::Actions::pinWindow(desired ? Config::Actions::TOGGLE_ACTION_ENABLE : Config::Actions::TOGGLE_ACTION_DISABLE, window));
     }
 
     if (action == "move" || action == "resize") {
@@ -2844,21 +2773,24 @@ SDispatchResult dispatchManage(const std::string& args) {
         const auto second = parseManageInteger(parts[3], action == "resize" ? 1 : -100000, 100000);
         if (!first || !second)
             return {.success = false, .error = "management coordinates or size are invalid"};
-        const auto payload = "exact " + std::to_string(*first) + " " + std::to_string(*second) + "," + identity.selector;
-        return runForWindow(action == "move" ? "movewindowpixel" : "resizewindowpixel", payload);
+        const Vector2D value{static_cast<double>(*first), static_cast<double>(*second)};
+        return manageActionResult(action == "move" ? Config::Actions::move(value, false, window) : Config::Actions::resize(value, false, window));
     }
 
     if (action == "maximize" || action == "unmaximize" || action == "fullscreen" || action == "unfullscreen") {
         if (const auto error = requireCount(2); error)
             return *error;
-        auto focused = runForWindow("focuswindow", "");
+        auto focused = manageActionResult(Config::Actions::focus(window));
         if (!focused.success)
             return focused;
-        if (!window->m_isMapped || Desktop::focusState()->window() != window)
+        if (!window->mapped() || Desktop::focusState()->window() != window)
             return {.success = false, .error = "qualified management target did not retain focus"};
         const bool maximize = action == "maximize" || action == "unmaximize";
         const bool enable = action == "maximize" || action == "fullscreen";
-        return runBuiltinDispatcher("fullscreen", std::string{maximize ? "1 " : "0 "} + (enable ? "set" : "unset"));
+        const auto mode = maximize ? Fullscreen::FSMODE_MAXIMIZED : Fullscreen::FSMODE_FULLSCREEN;
+        if (Fullscreen::controller()->isFullscreen(window, mode) != enable)
+            return manageActionResult(Config::Actions::fullscreenWindow(mode, true, window));
+        return {.success = true};
     }
 
     const bool workspaceMove = action == "move_to_workspace" || action == "workspace_move_window" || action == "move_window_to_workspace";
@@ -2874,8 +2806,7 @@ SDispatchResult dispatchManage(const std::string& args) {
         else if (parts[3] != "silent")
             return {.success = false, .error = "move_to_workspace mode must be follow or silent"};
     }
-    const auto payload = parts[2] + "," + identity.selector;
-    return runForWindow(follow ? "movetoworkspace" : "movetoworkspacesilent", payload);
+    return manageActionResult(Config::Actions::moveToWorkspace(parts[2], !follow, window));
 }
 
 SDispatchResult dispatchPanic(const std::string& args) {
@@ -3135,7 +3066,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-protal:approval", dispatchApproval);
     g_windowOpenEarlyListener = Event::bus()->m_events.window.openEarly.listen([](PHLWINDOW window) { handleWorkspaceSessionWindowOpenEarly(window); });
     g_windowOpenListener = Event::bus()->m_events.window.open.listen([](PHLWINDOW window) { handleWorkspaceSessionWindowOpen(window); });
-    g_renderStageListener = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) { renderAgentIndicator(stage); });
+    g_renderStageListener = Event::bus()->m_events.render.stage.listen([](const Event::SRenderStageEvent& event) { renderAgentIndicator(event); });
     g_keyboardInputListener = Event::bus()->m_events.input.keyboard.key.listen(
         [](const IKeyboard::SKeyEvent& event, Event::SCallbackInfo&) {
             handlePhysicalApprovalKey(event);

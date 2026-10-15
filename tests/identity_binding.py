@@ -213,7 +213,7 @@ def main() -> int:
 
     source = (ROOT / "src" / "plugin" / "main.cpp").read_text()
     assert "processStartTimeForPid" in source
-    assert "window->getPID() != identity.pid" in source
+    assert "window->backend().pid() != identity.pid" in source
     assert "*actualStartTime != identity.processStartTime" in source
     assert "auto window = resolveTargetWindow(targetRegex);" in source
     assert "auto window = resolveTargetWindow(parts[0]);" in source
@@ -222,7 +222,7 @@ def main() -> int:
     assert "captureScreenshotSession(std::filesystem::path(path), targetWindow)" in source
     assert "captureScreenshotSession(std::filesystem::path(path), parsedTarget.selector)" not in source
     screenshot_dispatch = source[source.index("SDispatchResult dispatchScreenshot("):source.index("SDispatchResult dispatchSession(")]
-    assert "window && window->m_isMapped && screenshotPrivacyDenied(window)" in screenshot_dispatch
+    assert "window && window->mapped() && screenshotPrivacyDenied(window)" in screenshot_dispatch
     assert "!window->isHidden()" not in screenshot_dispatch
     assert "m_workspace->isVisible()" not in screenshot_dispatch
     return 0

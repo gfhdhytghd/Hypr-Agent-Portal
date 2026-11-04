@@ -1,7 +1,5 @@
 # hypr-agent-portal
 
-##Since CUA have announced support for Omarchy/Hypeland, This project is no longer required by the world and people. So it been arcchived.
-
 hypr-agent-portal is an experimental Hyprland plugin plus MCP bridge for background agent control.
 
 It exposes a set of compositor dispatchers. With the legacy hyprlang config provider

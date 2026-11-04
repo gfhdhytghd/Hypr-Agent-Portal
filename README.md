@@ -36,7 +36,7 @@ hyprctl dispatch 'hl.plugin.hypr_agent_portal.approval("status 0123456789abcdef0
 `scripts/hypr-agent-portalctl` detects `configProvider: lua` and emits the Lua
 dispatcher expression automatically.
 
-The screenshot dispatcher renders active monitor workspaces into RGBA artifacts from inside Hyprland, then writes a JSON session file. When a window selector is supplied, it renders that window directly into an offscreen framebuffer, so the artifact is not occluded by other windows. On Hyprland v0.56, the pointer dispatcher resolves targets through `Desktop::viewState()->query()`, focuses the target surface only for the injected pointer events, sends motion/button/frame events through `g_pSeatManager`, then restores the previous pointer focus. Successful background pointer actions also render a non-interactive Codex-style cursor overlay with the target window's render pass, so it appears on the controlled app when that app is visible instead of being drawn as a global topmost layer.
+The screenshot dispatcher renders active monitor workspaces into RGBA artifacts from inside Hyprland, then writes a JSON session file. When a window selector is supplied, it renders that window directly into an offscreen framebuffer, so the artifact is not occluded by other windows. On Hyprland v0.56, the pointer dispatcher resolves targets through `Desktop::viewState()->query()`, focuses the target surface only for the injected pointer events, sends motion/button/frame events through `g_pSeatManager`, then restores the previous pointer focus. Successful background pointer actions also render a non-interactive Cua-inspired session cursor overlay with the target window's render pass, so it appears on the controlled app when that app is visible instead of being drawn as a global topmost layer.
 
 For XWayland windows, the dispatcher sends to the `wlSurface()` resource and scales surface-local coordinates by `m_X11SurfaceScaledBy`. If the requested global coordinate lands on a same-process XWayland helper window, such as a search popup, pointer and keyboard dispatch are automatically routed to that related window. For native Wayland windows, it resolves subsurfaces through the root `CWLSurfaceResource::at()` traversal so they receive surface-local coordinates.
 
@@ -512,6 +512,58 @@ scripts/hypr-agent-portalctl panic status
   events as a temporary fallback until modifier/clipboard paste delivery is
   fixed.
 
+## Session cursor visualization
+
+The native agent indicator is a **visual overlay**, not the human pointer and
+not an input seat. Its target-window clipping and input routing remain unchanged.
+Separate MCP transports have independent cursor identities, positions, colors,
+animations, and cleanup. Up to 32 live visual sessions are retained; idle sessions
+fade out and expire. The nine-color palette is deterministic, not unique: different
+sessions can share a color. Ending a visual cursor does not grant or revoke input
+access. Native screenshots suppress the live overlay; an explicit screenshot
+cursor debug option can add a cursor afterward.
+
+The Cua-inspired renderer provides a gradient arrow and glow, deterministic
+session colors, action feedback for click, typing, scroll and drag, curved
+spring-style movement, idle fading and reduced-motion support. This is a native
+procedural implementation, **not** a byte-for-byte copy of Cua's dotLottie theme
+renderer. Arbitrary dotLottie/theme imports, textual delivery/mode badges, Cua
+input seats, and foreground input fallback are not included. See [cursor attribution](THIRD_PARTY_CURSOR_NOTICES.md).
+
+Defaults: theme `gradient`, size 42 logical pixels, motion 450 ms, arc 25,
+spring 72, idle 30000 ms, fade 200 ms, reduced motion off. The `codex` compatibility
+theme preserves the pre-existing local texture loader. Config keys use the
+`cursor_` prefix: `cursor_theme`, `cursor_size`, `cursor_motion_ms`, `cursor_arc`,
+`cursor_spring`, `cursor_idle_ms`, `cursor_fade_ms`, `cursor_reduced_motion`.
+Motion accepts 0–3000 ms, arc/spring 0–100, idle 100–60000 ms, fade 0–5000 ms,
+and size 16–128. Reduced motion snaps position updates and suppresses animated
+feedback. Supported procedural themes are `gradient`, `classic`, and `minimal`.
+
+The MCP bridge exposes `get_agent_cursor_state`, `set_agent_cursor_settings`
+(`settings` is an object with the unprefixed keys above), and `end_agent_cursor`.
+Settings take effect on the next cursor activity; changing settings does not send
+input or resurrect an ended cursor. Reported `nativeVisibility` is `unknown`:
+bridge metadata is not proof that the compositor rendered a cursor. Each process
+creates its own random session ID; callers cannot choose another process's ID.
+Host defaults can be overridden with `HYPR_AGENT_PORTAL_CURSOR_THEME`,
+`HYPR_AGENT_PORTAL_CURSOR_MOTION_MS`, `HYPR_AGENT_PORTAL_CURSOR_ARC`,
+`HYPR_AGENT_PORTAL_CURSOR_SPRING`, `HYPR_AGENT_PORTAL_CURSOR_REDUCED_MOTION`
+(`0` or `1`), `HYPR_AGENT_PORTAL_CURSOR_IDLE_MS`,
+`HYPR_AGENT_PORTAL_CURSOR_FADE_MS`, and `HYPR_AGENT_PORTAL_CURSOR_SIZE`.
+Named debug cursor files are isolated from the legacy CLI `cursor.json`.
+
+CLI `pointer`, `keyboard`, and `indicator` accept `--cursor-session ID` and
+`--cursor-theme`, `--cursor-motion-ms`, `--cursor-arc`, `--cursor-spring`,
+`--cursor-reduced-motion`, `--cursor-idle-ms`, `--cursor-fade-ms`, `--cursor-size`.
+`indicator-end --cursor-session ID` cleans up only that visual session. Both Lua
+and legacy dispatcher adapters support it, including the `protal` compatibility
+namespace. Session IDs contain 1–64 ASCII letters, digits, `_` or `-`.
+
+Build and headless test results do not establish live compositor visual quality.
+Rebuild against the running Hyprland ABI and restart the compositor through your
+normal plugin-management workflow before validating the new renderer. Do not
+hot-replace a module already loaded into the compositor.
+
 ## Config
 
 ```ini
@@ -523,6 +575,9 @@ plugin {
     allow_session = 1
     show_indicator = 1
     indicator_timeout_ms = 30000
+    cursor_theme = gradient
+    cursor_motion_ms = 450
+    cursor_reduced_motion = 0
     # XWayland-only upper bound for a modified shortcut lease. Physical keyboard
     # input preempts the lease immediately; native Wayland never uses this delay.
     keyboard_restore_delay_ms = 700
@@ -547,6 +602,9 @@ hl.config({
       allow_session = true,
       show_indicator = true,
       indicator_timeout_ms = 30000,
+      cursor_theme = "gradient",
+      cursor_motion_ms = 450,
+      cursor_reduced_motion = false,
       keyboard_restore_delay_ms = 700,
       cancel_on_human_input = true,
       privacy_class_denylist = "org.keepassxc.KeePassXC,1Password",
@@ -556,7 +614,11 @@ hl.config({
 })
 ```
 
-The visible cursor uses `~/.config/hypr-agent-portal/codex-cursor-252.abgr` when present, and otherwise falls back to a procedural texture. Install an extracted Codex Computer Use cursor PNG into that local raw format with:
+With `cursor_theme = codex`, the visible cursor uses
+`~/.config/hypr-agent-portal/codex-cursor-252.abgr` when present, and otherwise
+falls back to a procedural texture. The default `gradient` theme does not load
+this artwork. Install an extracted Codex Computer Use cursor PNG into that local
+raw format with:
 
 ```sh
 scripts/install-codex-cursor-asset

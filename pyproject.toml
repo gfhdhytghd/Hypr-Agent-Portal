@@ -10,7 +10,7 @@ readme = "PYPI.md"
 requires-python = ">=3.10"
 authors = [{ name = "wilf" }]
 license = "GPL-3.0-only"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_CURSOR_NOTICES.md"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Operating System :: POSIX :: Linux",
@@ -34,6 +34,7 @@ script-files = [
   "mcp/hypr-agent-protal-mcp.py",
   "mcp/action_sequence.py",
   "mcp/compat_env.py",
+  "mcp/cursor_visualization.py",
   "mcp/hypr_management.py",
   "mcp/hypr_socket2.py",
   "mcp/image_pipeline.py",

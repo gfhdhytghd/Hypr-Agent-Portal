@@ -1,4 +1,5 @@
 #include "plugin/screenshot_capture.hpp"
+#include "plugin/cursor_visual.hpp"
 
 #include <hyprland/src/config/ConfigManager.hpp>
 #include <hyprland/src/config/lua/bindings/LuaBindingsInternal.hpp>
@@ -82,16 +83,24 @@ CHyprSignalListener              g_keyboardInputListener;
 CHyprSignalListener              g_pointerButtonInputListener;
 CHyprSignalListener              g_pointerMotionInputListener;
 CHyprSignalListener              g_pointerAxisInputListener;
-PHLWINDOWREF                     g_agentPointerWindow;
-std::optional<Vector2D>          g_agentPointerPosition;
-std::optional<Vector2D>          g_agentPointerStartPosition;
-std::optional<Vector2D>          g_agentPointerDisplayPosition;
-std::optional<Vector2D>          g_agentPointerRelativePosition;
-std::optional<Vector2D>          g_agentPointerRelativeStartPosition;
-std::optional<Vector2D>          g_agentPointerRelativeDisplayPosition;
-std::optional<Time::steady_tp>   g_agentPointerUpdated;
-std::optional<Time::steady_tp>   g_agentPointerMotionStarted;
-std::string                      g_agentPointerAction;
+struct SAgentCursor : CursorVisual::State {
+    PHLWINDOWREF window;
+    SP<Render::ITexture> texture;
+    int textureFrame = -1;
+    int textureCue = -1;
+};
+CursorVisual::Sessions<SAgentCursor> g_agentCursors;
+unsigned g_indicatorCaptureDepth = 0;
+struct ScopedIndicatorCapturePause {
+    ScopedIndicatorCapturePause() { ++g_indicatorCaptureDepth; }
+    ~ScopedIndicatorCapturePause() { --g_indicatorCaptureDepth; }
+    ScopedIndicatorCapturePause(const ScopedIndicatorCapturePause&) = delete;
+    ScopedIndicatorCapturePause& operator=(const ScopedIndicatorCapturePause&) = delete;
+};
+std::map<std::string, SP<Config::Values::CStringValue>> g_cursorStringConfig;
+std::map<std::string, SP<Config::Values::CIntValue>> g_cursorIntConfig;
+std::map<std::string, SP<Config::Values::CBoolValue>> g_cursorBoolConfig;
+
 SP<Render::ITexture>             g_codexCursorTexture;
 Vector2D                         g_codexCursorTextureSize;
 double                           g_codexCursorHotspotX = 0.0;
@@ -394,25 +403,62 @@ Vector2D agentIndicatorRenderedGlobalFromRelative(const PHLWINDOW& window, const
 }
 
 void damageAgentIndicator() {
-    if (!g_pHyprRenderer)
-        return;
-
-    if (const auto window = g_agentPointerWindow.lock()) {
-        g_pHyprRenderer->damageWindow(window, true);
-        if (g_agentPointerRelativePosition)
-            g_pHyprRenderer->damageBox(agentIndicatorBounds(agentIndicatorRenderedGlobalFromRelative(window, *g_agentPointerRelativePosition)));
-        if (g_agentPointerRelativeStartPosition)
-            g_pHyprRenderer->damageBox(agentIndicatorBounds(agentIndicatorRenderedGlobalFromRelative(window, *g_agentPointerRelativeStartPosition)));
-        if (g_agentPointerRelativeDisplayPosition)
-            g_pHyprRenderer->damageBox(agentIndicatorBounds(agentIndicatorRenderedGlobalFromRelative(window, *g_agentPointerRelativeDisplayPosition)));
+    if (!g_pHyprRenderer) return;
+    for (const auto& [id, cursor] : g_agentCursors.entries) {
+        if (const auto window = cursor.window.lock())
+            g_pHyprRenderer->damageWindow(window, true);
     }
+}
 
-    if (g_agentPointerPosition)
-        g_pHyprRenderer->damageBox(agentIndicatorBounds(*g_agentPointerPosition));
-    if (g_agentPointerStartPosition)
-        g_pHyprRenderer->damageBox(agentIndicatorBounds(*g_agentPointerStartPosition));
-    if (g_agentPointerDisplayPosition)
-        g_pHyprRenderer->damageBox(agentIndicatorBounds(*g_agentPointerDisplayPosition));
+double cursorNowMs() {
+    return std::chrono::duration<double, std::milli>(Time::steadyNow().time_since_epoch()).count();
+}
+
+CursorVisual::Settings cursorDefaults() {
+    CursorVisual::Settings result;
+    for (const auto& [name, value] : g_cursorIntConfig) {
+        const int configured = usingLegacyConfig() ? static_cast<int>(legacyCompatConfigValue<Hyprlang::INT>("cursor_" + name, value->value())) : value->value();
+        CursorVisual::option(result, name, std::to_string(configured));
+    }
+    for (const auto& [name, value] : g_cursorStringConfig) {
+        const auto configured = usingLegacyConfig() ? configString("cursor_" + name, value->value()) : value->value();
+        CursorVisual::option(result, name, configured);
+    }
+    for (const auto& [name, value] : g_cursorBoolConfig) {
+        const bool configured = usingLegacyConfig() ? legacyCompatConfigValue<Hyprlang::INT>("cursor_" + name, value->value()) != 0 : value->value();
+        CursorVisual::option(result, name, configured ? "1" : "0");
+    }
+    return result;
+}
+
+void registerCursorConfig() {
+    using namespace Config::Values;
+    struct Entry { const char* name; const char* path; int fallback; };
+    const std::array<Entry,6> ints{{
+        {"motion_ms","plugin.hypr_agent_portal.cursor_motion_ms",450},
+        {"arc","plugin.hypr_agent_portal.cursor_arc",25},
+        {"spring","plugin.hypr_agent_portal.cursor_spring",72},
+        {"idle_ms","plugin.hypr_agent_portal.cursor_idle_ms",30000},
+        {"fade_ms","plugin.hypr_agent_portal.cursor_fade_ms",200},
+        {"size","plugin.hypr_agent_portal.cursor_size",42}}};
+    for (const auto& [name, key, fallback] : ints) {
+        auto value = makeShared<CIntValue>(key, "agent cursor visualization", Config::INTEGER{fallback});
+        if (usingLegacyConfig()) {
+            HyprlandAPI::addConfigValue(g_pluginHandle, std::string{"plugin:hypr-agent-portal:cursor_"}+name, Hyprlang::INT{fallback});
+            HyprlandAPI::addConfigValue(g_pluginHandle, std::string{"plugin:hypr-agent-protal:cursor_"}+name, Hyprlang::INT{fallback});
+        } else registerConfigValue(value);
+        g_cursorIntConfig[name]=value;
+    }
+    auto theme=makeShared<CStringValue>("plugin.hypr_agent_portal.cursor_theme", "gradient, classic, minimal, codex", Config::STRING{"gradient"});
+    auto reduced=makeShared<CBoolValue>("plugin.hypr_agent_portal.cursor_reduced_motion", "disable cursor motion and animated feedback", false);
+    if (usingLegacyConfig()) {
+        HyprlandAPI::addConfigValue(g_pluginHandle,"plugin:hypr-agent-portal:cursor_theme",Hyprlang::STRING{"gradient"});
+        HyprlandAPI::addConfigValue(g_pluginHandle,"plugin:hypr-agent-protal:cursor_theme",Hyprlang::STRING{"gradient"});
+        HyprlandAPI::addConfigValue(g_pluginHandle,"plugin:hypr-agent-portal:cursor_reduced_motion",Hyprlang::INT{0});
+        HyprlandAPI::addConfigValue(g_pluginHandle,"plugin:hypr-agent-protal:cursor_reduced_motion",Hyprlang::INT{0});
+    } else { registerConfigValue(theme); registerConfigValue(reduced); }
+    g_cursorStringConfig["theme"]=theme;
+    g_cursorBoolConfig["reduced_motion"]=reduced;
 }
 
 int indicatorTimeoutMs() {
@@ -784,191 +830,114 @@ double officialSpringProgress(double elapsedMs) {
     return std::clamp(current, 0.0, 1.0);
 }
 
-Vector2D animatedAgentPosition(const Time::steady_tp& now, const PHLWINDOW& window, const CBox& bounds) {
-    if (!g_agentPointerPosition && !g_agentPointerRelativePosition)
-        return {};
-
-    const Vector2D target = g_agentPointerRelativePosition ? agentIndicatorRenderedGlobalFromRelative(window, *g_agentPointerRelativePosition) : *g_agentPointerPosition;
-    const Vector2D start = g_agentPointerRelativeStartPosition ? agentIndicatorRenderedGlobalFromRelative(window, *g_agentPointerRelativeStartPosition) :
-                                                        g_agentPointerStartPosition.value_or(target);
-    if (!g_agentPointerMotionStarted || vectorLength(Vector2D{target.x - start.x, target.y - start.y}) < 2.0)
-        return target;
-
-    const double elapsedMs = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(now - *g_agentPointerMotionStarted).count());
-    const double progress = officialSpringProgress(elapsedMs);
-    const auto   bezier = chooseCursorBezier(start, target, bounds);
-    return cubicPoint(start, bezier.control1, bezier.control2, target, progress);
-}
-
 void renderAgentIndicator(eRenderStage stage) {
-    if (stage != RENDER_POST_WINDOW || !configBool("show_indicator", true) || (!g_agentPointerPosition && !g_agentPointerRelativePosition) || !g_agentPointerUpdated ||
-        !g_pHyprOpenGL || !g_pHyprRenderer)
-        return;
-
-    const auto targetWindow = g_agentPointerWindow.lock();
-    const auto currentWindow = g_pHyprRenderer->m_renderData.currentWindow.lock();
-    if (!targetWindow || currentWindow != targetWindow)
-        return;
-
+    if (g_indicatorCaptureDepth || stage != RENDER_POST_WINDOW || !configBool("show_indicator", true) || !g_pHyprOpenGL || !g_pHyprRenderer) return;
+    const auto current = g_pHyprRenderer->m_renderData.currentWindow.lock();
     const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
-    if (!monitor)
-        return;
-
-    const auto windowBox = agentIndicatorRenderedWindowBox(targetWindow);
-    const auto   now = Time::steadyNow();
-    const double ageMs = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(now - *g_agentPointerUpdated).count());
-    const int    timeoutMs = indicatorTimeoutMs();
-    if (timeoutMs > 0 && ageMs > timeoutMs + 50.0)
-        return;
-
-    const double fade = timeoutMs <= 0 ? 1.0 : std::clamp((static_cast<double>(timeoutMs) - ageMs) / 900.0, 0.0, 1.0);
-    if (fade <= 0.0)
-        return;
-
-    const auto global = animatedAgentPosition(now, targetWindow, windowBox);
-    const auto monitorBox = CBox{monitor->m_position.x, monitor->m_position.y, monitor->m_size.x, monitor->m_size.y};
-    const auto visibleWindowBox = intersectBoxes(windowBox, monitorBox);
-    const auto displayGlobal = visibleWindowBox.empty() ? global : clampPointToBox(global, visibleWindowBox, 18.0);
-    g_agentPointerDisplayPosition = displayGlobal;
-    const auto anchor = agentIndicatorRenderedWindowAnchor(targetWindow);
-    g_agentPointerRelativeDisplayPosition = Vector2D{displayGlobal.x - anchor.x, displayGlobal.y - anchor.y};
-
-    const bool   clickLike = g_agentPointerAction == "click" || g_agentPointerAction == "doubleclick" || g_agentPointerAction == "double-click" ||
-        g_agentPointerAction == "press" || g_agentPointerAction == "down" || g_agentPointerAction == "release" || g_agentPointerAction == "up";
-    const double pulse = clickLike ? std::clamp(1.0 - ageMs / 420.0, 0.0, 1.0) : 0.0;
-    const double renderScale = std::max(1.0, static_cast<double>(monitor->m_scale));
-    const Vector2D tip{
-        (displayGlobal.x - monitor->m_position.x) * renderScale,
-        (displayGlobal.y - monitor->m_position.y) * renderScale,
-    };
-    const double renderSize = (CODEX_CURSOR_LOGICAL_SIZE + 2.0 * pulse) * renderScale;
-    const auto   texture = codexCursorTexture();
-    if (!texture || g_codexCursorTextureSize.x <= 0.0 || g_codexCursorTextureSize.y <= 0.0)
-        return;
-
-    const double x = tip.x - (g_codexCursorHotspotX / g_codexCursorTextureSize.x) * renderSize;
-    const double y = tip.y - (g_codexCursorHotspotY / g_codexCursorTextureSize.y) * renderSize;
-
-    CTexPassElement::SRenderData data;
-    data.tex = texture;
-    data.box = CBox{x, y, renderSize, renderSize};
-    data.a = static_cast<float>(fade);
-    g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(std::move(data)));
+    if (!current || !monitor) return;
+    const double now = cursorNowMs();
+    const double scale = std::max(1.0, static_cast<double>(monitor->m_scale));
+    const auto monitorBox = CBox{monitor->m_position.x,monitor->m_position.y,monitor->m_size.x,monitor->m_size.y};
+    for (auto& [id,cursor] : g_agentCursors.entries) {
+        if (cursor.window.lock() != current) continue;
+        const double age = now - cursor.updated;
+        const double alpha = CursorVisual::opacity(age, cursor.settings);
+        if (alpha <= 0) continue;
+        const auto bounds = intersectBoxes(agentIndicatorRenderedWindowBox(current), monitorBox);
+        if (bounds.empty()) continue;
+        auto position = CursorVisual::position(cursor.start,cursor.target,age,cursor.settings);
+        const auto anchor = agentIndicatorRenderedWindowAnchor(current);
+        auto global = Vector2D{anchor.x+position.x,anchor.y+position.y};
+        // Fit the WHOLE tile inside the visible target-window rectangle, not merely its tip.
+        const double factor = std::min({cursor.settings.size/36.0,bounds.w/CursorVisual::TILE,bounds.h/CursorVisual::TILE});
+        if (factor <= 0) continue;
+        const double tile = CursorVisual::TILE*factor;
+        double left = std::clamp(global.x-36*factor,bounds.x,bounds.x+bounds.w-tile);
+        double top = std::clamp(global.y-32*factor,bounds.y,bounds.y+bounds.h-tile);
+        cursor.display = position;
+        const int cue = CursorVisual::feedback(cursor.action);
+        const int frame = CursorVisual::frame(age,cursor.settings,cue);
+        if (!cursor.texture || frame != cursor.textureFrame || cue != cursor.textureCue) {
+            auto pixels = CursorVisual::raster(CursorVisual::color(id),cursor.settings,cue,frame);
+            cursor.texture = makeShared<Render::GL::CGLTexture>(DRM_FORMAT_ABGR8888,pixels.data(),CursorVisual::TILE*4,Vector2D{CursorVisual::TILE,CursorVisual::TILE},true);
+            cursor.textureFrame=frame;cursor.textureCue=cue;
+        }
+        if (cursor.settings.theme == "codex") {
+            const auto texture = codexCursorTexture();
+            if (texture) {
+                CTexPassElement::SRenderData compat;
+                compat.tex = texture;
+                compat.box = CBox{(left-monitor->m_position.x)*scale,(top-monitor->m_position.y)*scale,tile*scale,tile*scale};
+                compat.a = static_cast<float>(alpha);
+                g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(std::move(compat)));
+            }
+        }
+        CTexPassElement::SRenderData data;
+        data.tex=cursor.texture;
+        data.box=CBox{(left-monitor->m_position.x)*scale,(top-monitor->m_position.y)*scale,tile*scale,tile*scale};
+        data.a=static_cast<float>(alpha);
+        g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(std::move(data)));
+    }
 }
 
 void stopIndicatorTimer(SP<CEventLoopTimer>& timer) {
-    if (timer && g_pEventLoopManager)
-        g_pEventLoopManager->removeTimer(timer);
+    if (timer && g_pEventLoopManager) g_pEventLoopManager->removeTimer(timer);
     timer.reset();
 }
 
 void scheduleIndicatorAnimation() {
-    if (!g_pEventLoopManager || g_indicatorAnimationTimer)
-        return;
-
-    g_indicatorAnimationTimer = makeShared<CEventLoopTimer>(
-        std::chrono::milliseconds(16),
-        [](SP<CEventLoopTimer> self, void*) {
-            const auto now = Time::steadyNow();
-            const bool animationDone = g_agentPointerUpdated &&
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - *g_agentPointerUpdated).count() > CODEX_CURSOR_ANIMATION_MS;
-            const int  timeoutMs = indicatorTimeoutMs();
-            const bool expired = g_agentPointerUpdated && timeoutMs > 0 &&
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - *g_agentPointerUpdated).count() > timeoutMs + 50;
-            if ((!g_agentPointerPosition && !g_agentPointerRelativePosition) || !g_pEventLoopManager || expired) {
-                if (g_pEventLoopManager)
-                    g_pEventLoopManager->removeTimer(self);
-                if (g_indicatorAnimationTimer.get() == self.get())
-                    g_indicatorAnimationTimer.reset();
-                return;
-            }
-
-            damageAgentIndicator();
-            self->updateTimeout(animationDone ? std::chrono::milliseconds(33) : std::chrono::milliseconds(16));
-        },
-        nullptr);
+    if (!g_pEventLoopManager || g_indicatorAnimationTimer || g_agentCursors.entries.empty()) return;
+    g_indicatorAnimationTimer=makeShared<CEventLoopTimer>(std::chrono::milliseconds(16),[](SP<CEventLoopTimer> self,void*) {
+        const double now=cursorNowMs();
+        damageAgentIndicator(); // includes last frame before expiry / closed target cleanup
+        g_agentCursors.expire(now);
+        std::erase_if(g_agentCursors.entries,[](const auto& e){return !e.second.window.lock();});
+        if(g_agentCursors.entries.empty() || !g_pEventLoopManager) {
+            if(g_pEventLoopManager) g_pEventLoopManager->removeTimer(self);
+            if(g_indicatorAnimationTimer.get()==self.get()) g_indicatorAnimationTimer.reset();
+            return;
+        }
+        // Sleep until the next fade when static. No 60Hz idle wakeups or physics integration.
+        double delay=60000;
+        for(const auto& [id,cursor]:g_agentCursors.entries) {
+            const double age=now-cursor.updated;
+            const bool moving=std::hypot(cursor.start.x-cursor.target.x,cursor.start.y-cursor.target.y)>0.1;
+            const bool cue=CursorVisual::feedback(cursor.action)!=0;
+            const bool active=(!cursor.settings.reducedMotion && ((moving && age<cursor.settings.motionMs) || (cue && age<600))) || age>=cursor.settings.idleMs;
+            double next=std::max(1.0,cursor.settings.idleMs-age);
+            if(cue && age<600) next=std::min(next,600-age);
+            delay=std::min(delay,active?16.0:next);
+        }
+        self->updateTimeout(std::chrono::milliseconds(static_cast<int>(delay)));
+    },nullptr);
     g_pEventLoopManager->addTimer(g_indicatorAnimationTimer);
 }
 
-void scheduleIndicatorHide() {
-    if (!g_pEventLoopManager)
-        return;
+void scheduleIndicatorHide() {} // session lifecycle handled by the demand-driven animation timer
 
-    stopIndicatorTimer(g_indicatorHideTimer);
-    if (indicatorTimeoutMs() <= 0)
-        return;
-
-    g_indicatorHideTimer = makeShared<CEventLoopTimer>(
-        indicatorTimeout(),
-        [](SP<CEventLoopTimer> self, void*) {
-            damageAgentIndicator();
-            g_agentPointerWindow.reset();
-            g_agentPointerPosition.reset();
-            g_agentPointerStartPosition.reset();
-            g_agentPointerDisplayPosition.reset();
-            g_agentPointerRelativePosition.reset();
-            g_agentPointerRelativeStartPosition.reset();
-            g_agentPointerRelativeDisplayPosition.reset();
-            g_agentPointerUpdated.reset();
-            g_agentPointerMotionStarted.reset();
-            g_agentPointerAction.clear();
-
-            if (g_pEventLoopManager)
-                g_pEventLoopManager->removeTimer(self);
-            if (g_indicatorHideTimer.get() == self.get())
-                g_indicatorHideTimer.reset();
-            stopIndicatorTimer(g_indicatorAnimationTimer);
-        },
-        nullptr);
-    g_pEventLoopManager->addTimer(g_indicatorHideTimer);
-}
-
-void showAgentIndicator(const PHLWINDOW& targetWindow, const Vector2D& globalPos, std::string_view action) {
-    if (!configBool("show_indicator", true))
-        return;
-
-    const auto oldWindow = g_agentPointerWindow.lock();
-    const auto previousDisplay = g_agentPointerDisplayPosition;
-    const auto previousRelativeDisplay = g_agentPointerRelativeDisplayPosition;
-    const auto previousTarget = g_agentPointerPosition;
-    const auto previousRelativeTarget = g_agentPointerRelativePosition;
-    const auto now = Time::steadyNow();
-    Vector2D   motionStart = globalPos;
-    const auto anchor = agentIndicatorWindowAnchor(targetWindow);
-    const auto relative = Vector2D{globalPos.x - anchor.x, globalPos.y - anchor.y};
-    Vector2D   relativeMotionStart = relative;
-
-    if (!indicatorActionShouldSnap(action) && oldWindow && oldWindow == targetWindow) {
-        if (previousRelativeDisplay) {
-            relativeMotionStart = *previousRelativeDisplay;
-            motionStart = agentIndicatorRenderedGlobalFromRelative(targetWindow, relativeMotionStart);
-        } else if (previousDisplay && pointInsideBox(*previousDisplay, agentIndicatorRenderedWindowBox(targetWindow))) {
-            motionStart = *previousDisplay;
-            const auto renderedAnchor = agentIndicatorRenderedWindowAnchor(targetWindow);
-            relativeMotionStart = Vector2D{motionStart.x - renderedAnchor.x, motionStart.y - renderedAnchor.y};
-        } else if (previousRelativeTarget) {
-            relativeMotionStart = *previousRelativeTarget;
-            motionStart = agentIndicatorRenderedGlobalFromRelative(targetWindow, relativeMotionStart);
-        } else if (previousTarget && pointInsideBox(*previousTarget, targetWindow->getFullWindowBoundingBox())) {
-            motionStart = *previousTarget;
-            relativeMotionStart = Vector2D{motionStart.x - anchor.x, motionStart.y - anchor.y};
-        }
-    }
-
+void showAgentIndicator(const PHLWINDOW& targetWindow,const Vector2D& globalPos,std::string_view action,
+                        const std::string& session="legacy",const std::optional<CursorVisual::Settings>& settings=std::nullopt) {
+    if (!configBool("show_indicator",true) || !targetWindow) return;
+    const double now=cursorNowMs();
     damageAgentIndicator();
-    g_agentPointerWindow = PHLWINDOWREF{targetWindow};
-    g_agentPointerPosition = globalPos;
-    g_agentPointerStartPosition = motionStart;
-    g_agentPointerDisplayPosition = motionStart;
-    g_agentPointerRelativePosition = relative;
-    g_agentPointerRelativeStartPosition = relativeMotionStart;
-    g_agentPointerRelativeDisplayPosition = relativeMotionStart;
-    g_agentPointerUpdated = now;
-    g_agentPointerMotionStarted = now;
-    g_agentPointerAction = std::string(action);
+    g_agentCursors.expire(now);
+    const bool existed=g_agentCursors.entries.contains(session);
+    auto* cursor=g_agentCursors.get(session,now);
+    if(!cursor) return;
+    const auto anchor=agentIndicatorWindowAnchor(targetWindow);
+    const auto target=CursorVisual::Point{globalPos.x-anchor.x,globalPos.y-anchor.y};
+    auto start=target;
+    if(cursor->window.lock()==targetWindow && !indicatorActionShouldSnap(action))
+        start=CursorVisual::position(cursor->start,cursor->target,now-cursor->updated,cursor->settings);
+    cursor->window=PHLWINDOWREF{targetWindow};
+    const auto previousTheme=cursor->settings.theme;
+    if (settings || !existed || session == "legacy") cursor->settings=settings.value_or(cursorDefaults());
+    // Preserve the old indicator timeout knob for anonymous/CLI input cursors.
+    if(session=="legacy" && !settings) cursor->settings.idleMs=indicatorTimeoutMs();
+    cursor->start=start;cursor->target=target;cursor->display=start;cursor->updated=now;cursor->action=std::string{action};
+    if (previousTheme != cursor->settings.theme) { cursor->texture.reset();cursor->textureFrame=-1; }
     damageAgentIndicator();
-
-    scheduleIndicatorHide();
+    stopIndicatorTimer(g_indicatorAnimationTimer); // wake promptly if sleeping for idle fade
     scheduleIndicatorAnimation();
 }
 
@@ -1231,6 +1200,8 @@ struct TargetSurface {
 
 struct AsyncPointerOperation {
     std::string                  selector;
+    std::string                  cursorSession = "legacy";
+    std::optional<CursorVisual::Settings> cursorSettings;
     Vector2D                     start;
     Vector2D                     end;
     bool                         windowRelative = false;
@@ -2128,7 +2099,13 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
     if (!g_pSeatManager)
         return {.success = false, .error = "seat manager is not ready"};
 
-    const auto parts = splitCsv(args);
+    auto parts = splitCsv(args);
+    std::string cursorSession;
+    auto cursorSettings=cursorDefaults();
+    bool cursorOptions=false;
+    if (!CursorVisual::takeOptions(parts, cursorSession, cursorSettings, cursorOptions, 4))
+        return {.success = false, .error = "invalid cursor options"};
+    const std::optional<CursorVisual::Settings> visualSettings=cursorOptions ? std::optional{cursorSettings} : std::nullopt;
     if (parts.size() < 4)
         return {.success = false,
                 .error = "usage: hypr-agent-portal:pointer <window-regex>,<x>,<y>,<move|click|press|release|drag>[,<button>][,<drag-x>,<drag-y>,<duration-sec>]"};
@@ -2163,7 +2140,7 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
 
     if (action == "move" || action == "motion") {
         g_pSeatManager->sendPointerFrame();
-        showAgentIndicator(target->window, *globalPoint, action);
+        showAgentIndicator(target->window, *globalPoint, action, cursorSession, visualSettings);
         restore.restoreForTarget(*target);
         return {.success = true};
     }
@@ -2173,7 +2150,7 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
         const auto dx = parts.size() >= 6 ? parseDouble(parts[5]) : std::optional<double>{0.0};
         if (!dx || !dy)
             return {.success = false, .error = "scroll dx/dy must be finite numbers"};
-        showAgentIndicator(target->window, *globalPoint, action);
+        showAgentIndicator(target->window, *globalPoint, action, cursorSession, visualSettings);
         sendPointerScroll(*dx, *dy);
         restore.restoreLater(std::chrono::milliseconds(90), false);
         return {.success = true};
@@ -2197,6 +2174,8 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
         if (g_pEventLoopManager && durationSec > 0.0) {
             auto state = std::make_shared<AsyncPointerOperation>();
             state->selector = parts[0];
+            state->cursorSession = cursorSession;
+            state->cursorSettings = visualSettings;
             state->start = inputPoint;
             state->end = Vector2D{*x2, *y2};
             state->windowRelative = windowRelative;
@@ -2230,6 +2209,7 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
                                 g_pSeatManager->setPointerFocus(stepTarget->surface, stepTarget->local);
                                 g_pSeatManager->sendPointerMotion(nowMs(), stepTarget->local);
                                 g_pSeatManager->sendPointerFrame();
+                                showAgentIndicator(stepTarget->window, *global, "drag", state->cursorSession, state->cursorSettings);
                             }
                         }
                         removePointerTimer(self);
@@ -2258,7 +2238,7 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
                         g_pSeatManager->sendPointerButton(nowMs(), state->button, WL_POINTER_BUTTON_STATE_RELEASED);
                         state->buttonPressed = false;
                         g_pSeatManager->sendPointerFrame();
-                        showAgentIndicator(target.window, state->lastGlobal, "drag");
+                        showAgentIndicator(target.window, state->lastGlobal, "drag", state->cursorSession, state->cursorSettings);
 
                         if (target.window && target.window->m_isX11) {
                             g_pSeatManager->m_state.pointerFocus.reset();
@@ -2294,13 +2274,13 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
         }
         g_pSeatManager->sendPointerButton(nowMs(), *button, WL_POINTER_BUTTON_STATE_RELEASED);
         g_pSeatManager->sendPointerFrame();
-        showAgentIndicator(lastTarget.window, lastGlobal, action);
+        showAgentIndicator(lastTarget.window, lastGlobal, action, cursorSession, visualSettings);
         restore.restoreForTarget(lastTarget);
         return {.success = true};
     }
 
     if (action == "click") {
-        showAgentIndicator(target->window, *globalPoint, action);
+        showAgentIndicator(target->window, *globalPoint, action, cursorSession, visualSettings);
         g_pSeatManager->sendPointerButton(nowMs(), *button, WL_POINTER_BUTTON_STATE_PRESSED);
         g_pSeatManager->sendPointerButton(nowMs(), *button, WL_POINTER_BUTTON_STATE_RELEASED);
         g_pSeatManager->sendPointerFrame();
@@ -2309,7 +2289,7 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
     }
 
     if (action == "doubleclick" || action == "double-click") {
-        showAgentIndicator(target->window, *globalPoint, action);
+        showAgentIndicator(target->window, *globalPoint, action, cursorSession, visualSettings);
         g_pSeatManager->sendPointerButton(nowMs(), *button, WL_POINTER_BUTTON_STATE_PRESSED);
         g_pSeatManager->sendPointerButton(nowMs(), *button, WL_POINTER_BUTTON_STATE_RELEASED);
         g_pSeatManager->sendPointerFrame();
@@ -2327,6 +2307,8 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
         const auto targetButton = *button;
         auto operation = std::make_shared<AsyncPointerOperation>();
         operation->selector = targetSelector;
+        operation->cursorSession = cursorSession;
+        operation->cursorSettings = visualSettings;
         operation->start = targetInput;
         operation->end = targetInput;
         operation->windowRelative = targetWindowRelative;
@@ -2361,7 +2343,7 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
 
                 if (target) {
                     const auto targetGlobal = targetPointToGlobal(targetSelector, targetInput, targetWindowRelative);
-                    showAgentIndicator(target->window, targetGlobal.value_or(target->window->getFullWindowBoundingBox().middle()), "doubleclick");
+                    showAgentIndicator(target->window, targetGlobal.value_or(target->window->getFullWindowBoundingBox().middle()), "doubleclick", operation->cursorSession, operation->cursorSettings);
                 }
 
                 if (g_pSeatManager) {
@@ -2385,7 +2367,7 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
     }
 
     if (action == "press" || action == "down") {
-        showAgentIndicator(target->window, *globalPoint, action);
+        showAgentIndicator(target->window, *globalPoint, action, cursorSession, visualSettings);
         g_pSeatManager->sendPointerButton(nowMs(), *button, WL_POINTER_BUTTON_STATE_PRESSED);
         g_pSeatManager->sendPointerFrame();
         restore.restoreForTarget(*target);
@@ -2393,7 +2375,7 @@ SDispatchResult dispatchPointerWithMode(const std::string& args, bool windowRela
     }
 
     if (action == "release" || action == "up") {
-        showAgentIndicator(target->window, *globalPoint, action);
+        showAgentIndicator(target->window, *globalPoint, action, cursorSession, visualSettings);
         g_pSeatManager->sendPointerButton(nowMs(), *button, WL_POINTER_BUTTON_STATE_RELEASED);
         g_pSeatManager->sendPointerFrame();
         restore.restoreForTarget(*target);
@@ -2415,9 +2397,21 @@ SDispatchResult dispatchIndicator(const std::string& args) {
     if (!g_pCompositor)
         return {.success = false, .error = "compositor is not ready"};
 
-    const auto parts = splitCsv(args);
-    if (parts.size() < 3)
-        return {.success = false, .error = "usage: hypr-agent-portal:indicator <window-regex>,<global-x>,<global-y>[,<action>]"};
+    if(args.size()>2048) return {.success=false,.error="indicator arguments exceed 2048 bytes"};
+    auto parts = splitCsv(args);
+    if (parts.size() < 3 || parts.size()>13)
+        return {.success = false, .error = "usage: hypr-agent-portal:indicator <window-regex>,<global-x>,<global-y>[,<action>][,session=<id>][,<option>=<value>]"};
+    std::string session="legacy";
+    auto settings=cursorDefaults();
+    bool supplied=false;
+    if(!CursorVisual::takeOptions(parts,session,settings,supplied,3) || parts.size()>4)
+        return {.success=false,.error="invalid cursor options"};
+    if(!g_agentCursors.entries.contains(session) && g_agentCursors.entries.size()>=CursorVisual::MAX_SESSIONS) {
+        damageAgentIndicator();
+        g_agentCursors.expire(cursorNowMs());
+        if(g_agentCursors.entries.size()>=CursorVisual::MAX_SESSIONS)
+            return {.success=false,.error="cursor session limit reached"};
+    }
 
     const auto x = parseDouble(parts[1]);
     const auto y = parseDouble(parts[2]);
@@ -2431,8 +2425,21 @@ SDispatchResult dispatchIndicator(const std::string& args) {
     const Vector2D global{*x, *y};
     window = xwaylandRelatedWindowAt(window, global);
     const auto action = parts.size() >= 4 ? lower(parts[3]) : std::string{"move"};
-    showAgentIndicator(window, global, action);
+    if(action.size()>32) return {.success=false,.error="indicator action exceeds 32 bytes"};
+    showAgentIndicator(window, global, action,session,settings);
     return {.success = true};
+}
+
+SDispatchResult dispatchIndicatorEnd(const std::string& args) {
+    if(!CursorVisual::validSession(args)) return {.success=false,.error="invalid cursor session id"};
+    damageAgentIndicator();
+    g_agentCursors.end(args);
+    // Cleanup affects visualization only: do not cancel an in-flight input transaction.
+    if (g_asyncPointerOperation && g_asyncPointerOperation->cursorSession == args)
+        g_asyncPointerOperation->cursorSession.clear();
+    stopIndicatorTimer(g_indicatorAnimationTimer);
+    scheduleIndicatorAnimation();
+    return {.success=true};
 }
 
 SDispatchResult dispatchKeyboard(const std::string& args) {
@@ -2443,7 +2450,13 @@ SDispatchResult dispatchKeyboard(const std::string& args) {
     if (!g_pSeatManager)
         return {.success = false, .error = "seat manager is not ready"};
 
-    const auto parts = splitCsv(args);
+    auto parts = splitCsv(args);
+    std::string cursorSession;
+    auto cursorSettings=cursorDefaults();
+    bool cursorOptions=false;
+    if (!CursorVisual::takeOptions(parts, cursorSession, cursorSettings, cursorOptions, 3))
+        return {.success = false, .error = "invalid cursor options"};
+    const std::optional<CursorVisual::Settings> visualSettings=cursorOptions ? std::optional{cursorSettings} : std::nullopt;
     if (parts.size() < 3)
         return {.success = false, .error = "usage: hypr-agent-portal:keyboard <window-regex>,<tap|press|release>,<key>[,<modifiers>][,<global-x>,<global-y>]"};
 
@@ -2482,7 +2495,7 @@ SDispatchResult dispatchKeyboard(const std::string& args) {
     }
 
     const bool xwaylandLease = activateXWaylandKeyboardTarget(*target);
-    showAgentIndicator(target->window, indicatorGlobal.value_or(windowMainSurfaceGoalBox(target->window).middle()), "key");
+    showAgentIndicator(target->window, indicatorGlobal.value_or(windowMainSurfaceGoalBox(target->window).middle()), "key", cursorSession, visualSettings);
 
     KeyboardResourceTransaction transaction(target->surface);
     if (!transaction.ready()) {
@@ -2576,6 +2589,9 @@ SDispatchResult dispatchScreenshot(const std::string& args) {
             return {.success = false,
                     .error = "full-compositor screenshot is blocked while a mapped privacy_class_denylist window could enter capture metadata"};
     }
+    // Offscreen captures must not bake the live visual cursor into the image.
+    // Screenshot debug cursors are added explicitly by the bridge afterward.
+    const ScopedIndicatorCapturePause pause;
     const auto result = hypr_agent_portal::captureScreenshotSession(std::filesystem::path(path), targetWindow);
     if (!result.success)
         return {.success = false, .error = result.error};
@@ -2987,6 +3003,7 @@ enum class eLuaDispatcher : int {
     POINTER,
     POINTER_RELATIVE,
     INDICATOR,
+    INDICATOR_END,
     KEYBOARD,
     SCREENSHOT,
     SESSION,
@@ -3001,6 +3018,7 @@ SDispatchResult dispatchLuaPayload(eLuaDispatcher dispatcher, const std::string&
         case eLuaDispatcher::POINTER: return dispatchPointer(payload);
         case eLuaDispatcher::POINTER_RELATIVE: return dispatchPointerRelative(payload);
         case eLuaDispatcher::INDICATOR: return dispatchIndicator(payload);
+        case eLuaDispatcher::INDICATOR_END: return dispatchIndicatorEnd(payload);
         case eLuaDispatcher::KEYBOARD: return dispatchKeyboard(payload);
         case eLuaDispatcher::SCREENSHOT: return dispatchScreenshot(payload);
         case eLuaDispatcher::SESSION: return dispatchSession(payload);
@@ -3053,6 +3071,10 @@ int luaIndicator(lua_State* L) {
     return makeLuaDispatcher(L, eLuaDispatcher::INDICATOR);
 }
 
+int luaIndicatorEnd(lua_State* L) {
+    return makeLuaDispatcher(L, eLuaDispatcher::INDICATOR_END);
+}
+
 int luaKeyboard(lua_State* L) {
     return makeLuaDispatcher(L, eLuaDispatcher::KEYBOARD);
 }
@@ -3089,6 +3111,7 @@ void registerLuaDispatchers() {
         HyprlandAPI::addLuaFunction(g_pluginHandle, name, "pointer", luaPointer);
         HyprlandAPI::addLuaFunction(g_pluginHandle, name, "pointer_relative", luaPointerRelative);
         HyprlandAPI::addLuaFunction(g_pluginHandle, name, "indicator", luaIndicator);
+        HyprlandAPI::addLuaFunction(g_pluginHandle, name, "indicator_end", luaIndicatorEnd);
         HyprlandAPI::addLuaFunction(g_pluginHandle, name, "keyboard", luaKeyboard);
         HyprlandAPI::addLuaFunction(g_pluginHandle, name, "screenshot", luaScreenshot);
         HyprlandAPI::addLuaFunction(g_pluginHandle, name, "session", luaSession);
@@ -3113,9 +3136,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     registerPluginConfig();
     registerLuaDispatchers();
 
+    registerCursorConfig();
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-portal:pointer", dispatchPointer);
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-portal:pointer-relative", dispatchPointerRelative);
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-portal:indicator", dispatchIndicator);
+    HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-portal:indicator-end", dispatchIndicatorEnd);
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-portal:keyboard", dispatchKeyboard);
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-portal:screenshot", dispatchScreenshot);
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-portal:session", dispatchSession);
@@ -3126,6 +3151,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-protal:pointer", dispatchPointer);
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-protal:pointer-relative", dispatchPointerRelative);
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-protal:indicator", dispatchIndicator);
+    HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-protal:indicator-end", dispatchIndicatorEnd);
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-protal:keyboard", dispatchKeyboard);
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-protal:screenshot", dispatchScreenshot);
     HyprlandAPI::addDispatcherV2(g_pluginHandle, "hypr-agent-protal:session", dispatchSession);
@@ -3184,16 +3210,10 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_workspaceRestackTimers.clear();
     g_indicatorHideTimer.reset();
     g_indicatorAnimationTimer.reset();
-    g_agentPointerWindow.reset();
-    g_agentPointerPosition.reset();
-    g_agentPointerStartPosition.reset();
-    g_agentPointerDisplayPosition.reset();
-    g_agentPointerRelativePosition.reset();
-    g_agentPointerRelativeStartPosition.reset();
-    g_agentPointerRelativeDisplayPosition.reset();
-    g_agentPointerUpdated.reset();
-    g_agentPointerMotionStarted.reset();
-    g_agentPointerAction.clear();
+    g_agentCursors.entries.clear();
+    g_cursorIntConfig.clear();
+    g_cursorStringConfig.clear();
+    g_cursorBoolConfig.clear();
     g_config = {};
     g_pluginHandle = nullptr;
 }

@@ -127,6 +127,7 @@ target_link_libraries(hypr_agent_portal PRIVATE ${HYPR_DEPS_LIBRARIES} ${LUA_LIB
 target_link_options(hypr_agent_portal PRIVATE -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
 
 install(TARGETS hypr_agent_portal LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES THIRD_PARTY_CURSOR_NOTICES.md DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/hypr-agent-portal)
 install(PROGRAMS
   scripts/hypr-agent-portalctl
   scripts/hypr-agent-protalctl
@@ -139,6 +140,7 @@ install(PROGRAMS
 install(FILES
   mcp/action_sequence.py
   mcp/compat_env.py
+  mcp/cursor_visualization.py
   mcp/hypr_management.py
   mcp/hypr_socket2.py
   mcp/image_pipeline.py
@@ -152,7 +154,16 @@ install(FILES
   DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
+if(BUILD_TESTING)
+  add_executable(cursor_visual_unit tests/test_cursor_visual.cpp)
+  target_include_directories(cursor_visual_unit PRIVATE src)
+  target_compile_options(cursor_visual_unit PRIVATE -UNDEBUG)
+  add_test(NAME hypr-agent-portal-cursor-visual-unit COMMAND cursor_visual_unit)
+endif()
+
 if(BUILD_TESTING AND Python3_Interpreter_FOUND)
+  add_test(NAME hypr-agent-portal-cursor-sessions
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/cursor_sessions.py)
   add_test(
     NAME hypr-agent-portal-python-compile
     COMMAND ${Python3_EXECUTABLE} -m py_compile
@@ -164,6 +175,8 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
       ${CMAKE_SOURCE_DIR}/mcp/hypr-agent-protal-mcp.py
       ${CMAKE_SOURCE_DIR}/mcp/action_sequence.py
       ${CMAKE_SOURCE_DIR}/mcp/compat_env.py
+      ${CMAKE_SOURCE_DIR}/mcp/cursor_visualization.py
+      ${CMAKE_SOURCE_DIR}/tests/cursor_sessions.py
       ${CMAKE_SOURCE_DIR}/mcp/hypr_management.py
       ${CMAKE_SOURCE_DIR}/mcp/hypr_socket2.py
       ${CMAKE_SOURCE_DIR}/mcp/image_pipeline.py

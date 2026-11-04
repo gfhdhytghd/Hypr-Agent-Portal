@@ -9,6 +9,7 @@ import os
 import pathlib
 import re
 import secrets
+import signal
 import shlex
 import shutil
 import stat
@@ -24,6 +25,7 @@ MCP_MODULE_DIR = pathlib.Path(__file__).resolve().parent
 if str(MCP_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MCP_MODULE_DIR))
 
+from cursor_visualization import new_session_id, settings_from_env, settings_schema, state_filename, validate_settings
 from compat_env import promote_legacy_environment
 from security_audit import AuditJournal, ReplayPolicy, preflight_replay
 from security_doctor import security_readiness_diagnostics
@@ -76,6 +78,12 @@ MAX_TOOL_WAIT_SECONDS = 30.0
 LAUNCH_UNMATCHED_WINDOW_GRACE_SECONDS = 1.0
 SECURITY_OWNER = f"stdio:{os.getpid()}"
 SECURITY_POLICY: SecurityPolicy = policy_from_env()
+# Random process-private visualization identity; never derived from caller args,
+# security owner, or a caller/host supplied session id.
+CURSOR_SESSION = new_session_id()
+CURSOR_SETTINGS = settings_from_env(os.environ)
+CURSOR_ENDED = False
+CURSOR_STATE_LOCK = threading.RLock()
 
 
 def env_enabled(name: str, default: bool = False) -> bool:
@@ -428,6 +436,7 @@ READ_ONLY_TOOL_NAMES = {
     "screenshot",
     "get_screenshot",
     "get_cursor_position",
+    "get_agent_cursor_state",
     "wait",
     "wait_for_window",
     "wait_for_close",
@@ -887,6 +896,12 @@ def tool_definitions() -> list[dict[str, Any]]:
         ]
     )
 
+    definitions.extend([
+        {"name": "get_agent_cursor_state", "description": "Read only this MCP process's visualization settings and last debug position; native visibility is not inferred.", "annotations": READ_ONLY_ANNOTATIONS, "inputSchema": object_schema({})},
+        {"name": "set_agent_cursor_settings", "description": "Update bounded visualization settings for this process; applied on next cursor activity, without injecting input or restarting an ended cursor.", "annotations": ACTION_ANNOTATIONS, "inputSchema": object_schema({"settings": {"type": "object", "properties": settings_schema(), "additionalProperties": False}}, ["settings"])},
+        {"name": "end_agent_cursor", "description": "End only this process's cursor visualization, not input authority or another process's cursor. Later input can show it again.", "annotations": ACTION_ANNOTATIONS, "inputSchema": object_schema({})},
+    ])
+
     readonly_actions = {
         "screenshot",
         "windows",
@@ -932,6 +947,18 @@ def error(req_id: Any, code: int, message: str) -> dict[str, Any]:
 
 
 def call_ctl(args: list[str]) -> dict[str, Any]:
+    global CURSOR_ENDED
+    args = list(args)
+    if args and args[0] in {"pointer", "keyboard", "indicator", "screenshot", "indicator-end"}:
+        if "--cursor-session" in args or any(arg.startswith("--cursor-session=") for arg in args):
+            raise ValueError("cursor session identity is owned by the MCP process")
+        args.extend(["--cursor-session", CURSOR_SESSION])
+        if args[0] in {"pointer", "keyboard", "indicator"}:
+            with CURSOR_STATE_LOCK:
+                for key, value in CURSOR_SETTINGS.items():
+                    args.extend(["--cursor-" + key.replace("_", "-"), str(int(value)) if isinstance(value, bool) else str(value)])
+                # A failed/uncertain transport might still have shown the cursor.
+                CURSOR_ENDED = False
     try:
         proc = subprocess.run(
             [str(find_ctl()), *args],
@@ -2617,7 +2644,7 @@ def screenshot_state_root() -> pathlib.Path:
 
 
 def cursor_state_path() -> pathlib.Path:
-    return screenshot_state_root() / "cursor.json"
+    return screenshot_state_root() / state_filename(CURSOR_SESSION)
 
 
 def screenshot_for_window(window: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -2662,7 +2689,7 @@ def agent_cursor_position() -> dict[str, Any] | None:
         os.close(root_fd)
         raise RuntimeError("refusing unsafe hypr-agent-portal state root")
     try:
-        fd = os.open("cursor.json", os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd)
+        fd = os.open(state_filename(CURSOR_SESSION), os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd)
     except FileNotFoundError:
         os.close(root_fd)
         return None
@@ -6043,7 +6070,43 @@ def tool_sequence(args: dict[str, Any]) -> dict[str, Any]:
                 ACTIVE_SEQUENCE_CANCELLATION = None
 
 
+def tool_get_agent_cursor_state(_: dict[str, Any]) -> dict[str, Any]:
+    with CURSOR_STATE_LOCK:
+        state = {"cursor_session": CURSOR_SESSION, "settings": dict(CURSOR_SETTINGS),
+                 "ended": CURSOR_ENDED, "position": None if CURSOR_ENDED else agent_cursor_position(),
+                 "visualizationOnly": True, "nativeVisibility": "unknown"}
+    return result_text(state)
+
+
+def tool_set_agent_cursor_settings(args: dict[str, Any]) -> dict[str, Any]:
+    global CURSOR_SETTINGS
+    if set(args) - {"settings", "dry_run", "confirmation_token"}:
+        raise ValueError("unsupported cursor settings argument")
+    settings = validate_settings(args.get("settings"))
+    with CURSOR_STATE_LOCK:
+        CURSOR_SETTINGS = {**CURSOR_SETTINGS, **settings}
+    # Do not synthesize pointer/keyboard input or resurrect an ended cursor.
+    return result_text({"ok": True, "cursor_session": CURSOR_SESSION,
+                        "settings": dict(CURSOR_SETTINGS), "appliesOn": "next cursor activity",
+                        "visualizationOnly": True})
+
+
+def end_own_agent_cursor() -> dict[str, Any]:
+    global CURSOR_ENDED
+    with CURSOR_STATE_LOCK:
+        result = call_ctl(["indicator-end", "--json"])
+        CURSOR_ENDED = True
+        return result
+
+
+def tool_end_agent_cursor(_: dict[str, Any]) -> dict[str, Any]:
+    return result_text({**end_own_agent_cursor(), "visualizationOnly": True, "inputAuthorityEnded": False})
+
+
 SEMANTIC_TOOLS = {
+    "get_agent_cursor_state": tool_get_agent_cursor_state,
+    "set_agent_cursor_settings": tool_set_agent_cursor_settings,
+    "end_agent_cursor": tool_end_agent_cursor,
     "list_apps": tool_list_apps,
     "list_windows": tool_list_apps,
     "launch_app": tool_launch_app,
@@ -6398,6 +6461,7 @@ OBSERVATION_ACTIONS = {
     "wait_for_close",
     "doctor",
     "get_cursor_position",
+    "get_agent_cursor_state",
     "security_status",
     "audit_replay",
     "request_confirmation",
@@ -6765,7 +6829,7 @@ def prepare_execution_args(tool_name: str, args: dict[str, Any]) -> tuple[dict[s
     """
     prepared = dict(args)
     action = canonical_security_action(tool_name, prepared)
-    if action in {"launch", "launch_app", "open_app", "sequence", "panic"}:
+    if action in {"launch", "launch_app", "open_app", "sequence", "panic", "get_agent_cursor_state", "set_agent_cursor_settings", "end_agent_cursor"}:
         return prepared, None
     if prepared.get("prefer_related") is True:
         raise RuntimeError("prefer_related is unsafe; inspect app state and target the related popup explicitly")
@@ -6881,7 +6945,7 @@ def build_security_request(
             required_level = AuthorizationLevel.VIEW
     if resolved_target is not None:
         target = resolved_target
-    elif action in {"launch", "launch_app", "open_app", "sequence", "panic"}:
+    elif action in {"launch", "launch_app", "open_app", "sequence", "panic", "get_agent_cursor_state", "set_agent_cursor_settings", "end_agent_cursor"}:
         target = security_target(args, resolve=False)
     else:
         # Identity lookup is read-only and is required in dry-run too.  A
@@ -7155,7 +7219,7 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
     return error(req_id, -32601, f"method not found: {method}")
 
 
-def main() -> int:
+def stdio_main() -> int:
     global SEQUENCE_WORKER_PENDING
     ensure_session_environment()
     output_lock = threading.Lock()
@@ -7199,6 +7263,31 @@ def main() -> int:
     for worker in workers:
         worker.join()
     return 0
+
+
+def main() -> int:
+    previous = None
+    if threading.current_thread() is threading.main_thread():
+        previous = signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        return stdio_main()
+    finally:
+        # On exceptional shutdown stop/join the sequence before retiring its
+        # visualization, so a late worker cannot recreate the cursor afterward.
+        global PENDING_SEQUENCE_CANCEL
+        PENDING_SEQUENCE_CANCEL = True
+        with SEQUENCE_STATE_LOCK:
+            if ACTIVE_SEQUENCE_CANCELLATION is not None:
+                ACTIVE_SEQUENCE_CANCELLATION.cancel("stdio shutdown")
+        for worker in threading.enumerate():
+            if worker.name == "hypr-agent-portal-sequence" and worker is not threading.current_thread():
+                worker.join()
+        try:
+            end_own_agent_cursor()
+        except Exception as exc:
+            print(f"cursor cleanup failed: {type(exc).__name__}", file=sys.stderr)
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":

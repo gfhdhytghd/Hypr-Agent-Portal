@@ -180,30 +180,31 @@ def main() -> int:
             assert "invalid artifact size" in failure_output.getvalue()
             assert str(runtime) not in failure_output.getvalue()
             private_root = ctl.state_root()
-            assert mcp.cursor_state_path() == private_root / "cursor.json"
-            ctl.write_agent_cursor(private_root / "cursor.json", target="address:0x1", x=3, y=4, action="move", button="left")
+            cursor_name = f"cursor-{mcp.CURSOR_SESSION}.json"
+            assert mcp.cursor_state_path() == private_root / cursor_name
+            ctl.write_agent_cursor(private_root / cursor_name, target="address:0x1", x=3, y=4, action="move", button="left")
             assert mcp.agent_cursor_position()["x"] == 3.0
-            (private_root / "cursor.json").unlink()
+            (private_root / cursor_name).unlink()
             cursor_victim = runtime / "cursor-victim"
             cursor_victim.write_text('{"x": 8, "y": 9}')
             cursor_victim.chmod(0o600)
-            (private_root / "cursor.json").symlink_to(cursor_victim)
+            (private_root / cursor_name).symlink_to(cursor_victim)
             try:
                 mcp.agent_cursor_position()
             except RuntimeError as exc:
                 assert "unsafe cursor state" in str(exc)
             else:
                 raise AssertionError("cursor symlink was accepted")
-            (private_root / "cursor.json").unlink()
-            (private_root / "cursor.json").write_bytes(b"x" * (mcp.MAX_CURSOR_STATE_BYTES + 1))
-            (private_root / "cursor.json").chmod(0o600)
+            (private_root / cursor_name).unlink()
+            (private_root / cursor_name).write_bytes(b"x" * (mcp.MAX_CURSOR_STATE_BYTES + 1))
+            (private_root / cursor_name).chmod(0o600)
             try:
                 mcp.agent_cursor_position()
             except RuntimeError as exc:
                 assert "unsafe cursor state" in str(exc) or "oversized" in str(exc)
             else:
                 raise AssertionError("oversized cursor state was accepted")
-            (private_root / "cursor.json").unlink()
+            (private_root / cursor_name).unlink()
 
             leftovers = [path for path in private_root.iterdir() if path.name != "cursor.json"]
             assert leftovers == [], leftovers

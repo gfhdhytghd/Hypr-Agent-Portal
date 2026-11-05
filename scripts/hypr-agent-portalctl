@@ -14,6 +14,26 @@ import tempfile
 import time
 import zlib
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "mcp"))
+from cursor_visualization import DEFAULT_SETTINGS, metadata as cursor_metadata, state_filename, validate_session, validate_settings
+
+
+def cursor_options(args):
+    values = {key: getattr(args, "cursor_" + key, None) for key in DEFAULT_SETTINGS}
+    return validate_settings({key: value for key, value in values.items() if value is not None}, from_strings=True)
+
+
+def cursor_payload(args, payload):
+    parts = cursor_metadata(getattr(args, "cursor_session", None), cursor_options(args))
+    return ",".join([payload, *parts]) if parts else payload
+
+
+def add_cursor_options(parser, *, settings=True):
+    parser.add_argument("--cursor-session", type=validate_session, help="visualization session only; does not change input authority")
+    if settings:
+        for key in DEFAULT_SETTINGS:
+            parser.add_argument("--cursor-" + key.replace("_", "-"), dest="cursor_" + key, help="bounded visualization setting")
+
 
 CURSOR_BITMAP = [
     "X...........",
@@ -302,8 +322,8 @@ def cleanup_screenshot_provenance(provenance: dict) -> None:
                 pass
 
 
-def cursor_state_path(output_dir: str | None = None) -> pathlib.Path:
-    return state_root(output_dir) / "cursor.json"
+def cursor_state_path(output_dir: str | None = None, cursor_session: str | None = None) -> pathlib.Path:
+    return state_root(output_dir) / state_filename(cursor_session)
 
 
 def finite_float(value) -> float | None:
@@ -618,6 +638,7 @@ def lua_plugin_dispatcher(dispatcher: str, payload: str) -> str | None:
         "hypr-agent-portal:pointer": ("hypr_agent_portal", "pointer"),
         "hypr-agent-portal:pointer-relative": ("hypr_agent_portal", "pointer_relative"),
         "hypr-agent-portal:indicator": ("hypr_agent_portal", "indicator"),
+        "hypr-agent-portal:indicator-end": ("hypr_agent_portal", "indicator_end"),
         "hypr-agent-portal:keyboard": ("hypr_agent_portal", "keyboard"),
         "hypr-agent-portal:screenshot": ("hypr_agent_portal", "screenshot"),
         "hypr-agent-portal:session": ("hypr_agent_portal", "session"),
@@ -628,6 +649,7 @@ def lua_plugin_dispatcher(dispatcher: str, payload: str) -> str | None:
         "hypr-agent-protal:pointer": ("hypr_agent_protal", "pointer"),
         "hypr-agent-protal:pointer-relative": ("hypr_agent_protal", "pointer_relative"),
         "hypr-agent-protal:indicator": ("hypr_agent_protal", "indicator"),
+        "hypr-agent-protal:indicator-end": ("hypr_agent_protal", "indicator_end"),
         "hypr-agent-protal:keyboard": ("hypr_agent_protal", "keyboard"),
         "hypr-agent-protal:screenshot": ("hypr_agent_protal", "screenshot"),
         "hypr-agent-protal:session": ("hypr_agent_protal", "session"),
@@ -704,7 +726,7 @@ def screenshot(args: argparse.Namespace) -> int:
         png, metadata = render_session_png(
             session,
             cursor_source=cursor_source,
-            cursor_path=root / "cursor.json",
+            cursor_path=root / state_filename(getattr(args, "cursor_session", None)),
             model_resolution=args.model_resolution,
             max_dimension=max(0, int(args.max_dimension or 0)),
         )
@@ -740,9 +762,9 @@ def pointer(args: argparse.Namespace) -> int:
             return 2
         payload = ",".join([args.target, str(args.x), str(args.y), args.action, args.button, str(args.x2), str(args.y2), str(max(0.0, min(args.duration, 3.0)))])
     dispatcher = args.dispatcher
-    if args.relative and dispatcher == "hypr-agent-portal:pointer":
-        dispatcher = "hypr-agent-portal:pointer-relative"
-    result = dispatch(dispatcher, payload)
+    if args.relative and dispatcher in {"hypr-agent-portal:pointer", "hypr-agent-protal:pointer"}:
+        dispatcher += "-relative"
+    result = dispatch(dispatcher, cursor_payload(args, payload))
     if result.returncode != 0:
         print(result.stderr or result.stdout, file=sys.stderr, end="")
         return result.returncode or 1
@@ -752,7 +774,7 @@ def pointer(args: argparse.Namespace) -> int:
         global_cursor = window_relative_to_global(args.target, cursor_x, cursor_y)
         if global_cursor is not None:
             cursor_x, cursor_y = global_cursor
-    write_agent_cursor(cursor_state_path(), target=args.target, x=cursor_x, y=cursor_y, action=args.action, button=args.button)
+    write_agent_cursor(cursor_state_path(cursor_session=getattr(args, "cursor_session", None)), target=args.target, x=cursor_x, y=cursor_y, action=args.action, button=args.button)
     if args.json:
         print(
             json.dumps(
@@ -779,13 +801,38 @@ def pointer(args: argparse.Namespace) -> int:
 
 def indicator(args: argparse.Namespace) -> int:
     payload = ",".join([args.target, str(args.x), str(args.y), args.action])
-    result = dispatch(args.dispatcher, payload)
+    result = dispatch(args.dispatcher, cursor_payload(args, payload))
     if result.returncode != 0:
         print(result.stderr or result.stdout, file=sys.stderr, end="")
         return result.returncode or 1
-    write_agent_cursor(cursor_state_path(), target=args.target, x=args.x, y=args.y, action=args.action, button="left")
+    write_agent_cursor(cursor_state_path(cursor_session=getattr(args, "cursor_session", None)), target=args.target, x=args.x, y=args.y, action=args.action, button="left")
     if args.json:
         print(json.dumps({"ok": True, "target": args.target, "x": args.x, "y": args.y, "action": args.action}))
+    else:
+        print(result.stdout, end="")
+    return 0
+
+
+def indicator_end(args: argparse.Namespace) -> int:
+    cursor_session = getattr(args, "cursor_session", None)
+    if cursor_session is not None:
+        validate_session(cursor_session)
+    result = dispatch(args.dispatcher, cursor_session or "legacy")
+    if result.returncode != 0:
+        print(result.stderr or result.stdout, file=sys.stderr, end="")
+        return result.returncode or 1
+    # Never remove the compatibility file for a named session.
+    path = cursor_state_path(cursor_session=cursor_session)
+    root_fd = _validated_private_directory(path.parent, label="hypr-agent-portal private state directory")
+    try:
+        try:
+            os.unlink(path.name, dir_fd=root_fd)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(root_fd)
+    if args.json:
+        print(json.dumps({"ok": True, "cursor_session": cursor_session or "legacy", "inputAuthorityEnded": False}))
     else:
         print(result.stdout, end="")
     return 0
@@ -799,12 +846,12 @@ def keyboard(args: argparse.Namespace) -> int:
             return 2
         parts.extend([str(args.x), str(args.y)])
 
-    result = dispatch(args.dispatcher, ",".join(parts))
+    result = dispatch(args.dispatcher, cursor_payload(args, ",".join(parts)))
     if result.returncode != 0:
         print(result.stderr or result.stdout, file=sys.stderr, end="")
         return result.returncode or 1
     if args.x is not None and args.y is not None:
-        write_agent_cursor(cursor_state_path(), target=args.target, x=args.x, y=args.y, action="key", button="left")
+        write_agent_cursor(cursor_state_path(cursor_session=getattr(args, "cursor_session", None)), target=args.target, x=args.x, y=args.y, action="key", button="left")
     if args.json:
         print(json.dumps({"ok": True, "target": args.target, "action": args.action, "key": args.key, "modifiers": args.modifiers or ""}))
     else:
@@ -1044,6 +1091,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="debug PNG cursor indicator source; auto prefers the last background pointer coordinate",
     )
     shot.set_defaults(func=screenshot)
+    add_cursor_options(shot, settings=False)
 
     ptr = sub.add_parser("pointer", help="send pointer input to a target window")
     ptr.add_argument("target", help="Hyprland window regex, for example address:0x1234")
@@ -1059,6 +1107,7 @@ def build_parser() -> argparse.ArgumentParser:
     ptr.add_argument("--dispatcher", default="hypr-agent-portal:pointer")
     ptr.add_argument("--json", action="store_true")
     ptr.set_defaults(func=pointer)
+    add_cursor_options(ptr)
 
     ind = sub.add_parser("indicator", help="show the agent cursor indicator without sending input")
     ind.add_argument("target", help="Hyprland window regex, for example address:0x1234")
@@ -1068,6 +1117,13 @@ def build_parser() -> argparse.ArgumentParser:
     ind.add_argument("--dispatcher", default="hypr-agent-portal:indicator")
     ind.add_argument("--json", action="store_true")
     ind.set_defaults(func=indicator)
+    add_cursor_options(ind)
+
+    end = sub.add_parser("indicator-end", help="end only this cursor visualization, not input authority")
+    end.add_argument("--dispatcher", default="hypr-agent-portal:indicator-end")
+    end.add_argument("--json", action="store_true")
+    add_cursor_options(end, settings=False)
+    end.set_defaults(func=indicator_end)
 
     key = sub.add_parser("keyboard", help="send keyboard input to a target window")
     key.add_argument("target", help="Hyprland window regex, for example address:0x1234")
@@ -1079,6 +1135,7 @@ def build_parser() -> argparse.ArgumentParser:
     key.add_argument("--dispatcher", default="hypr-agent-portal:keyboard")
     key.add_argument("--json", action="store_true")
     key.set_defaults(func=keyboard)
+    add_cursor_options(key)
 
     sess = sub.add_parser("session", help="begin, sync, or end a related-window workspace guard session")
     sess.add_argument("action", choices=["begin", "sync", "end"])
@@ -1115,6 +1172,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    try:
+        cursor_options(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args.func(args)
 
 

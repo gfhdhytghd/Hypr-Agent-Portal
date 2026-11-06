@@ -115,6 +115,8 @@ def main() -> int:
     assert tools_by_name["click_text"]["inputSchema"]["properties"]["match"]["enum"] == ["exact", "contains"]
     assert tools_by_name["get_marks"]["inputSchema"]["properties"]["zoom"]["maximum"] == 8
     assert tools_by_name["sequence"]["inputSchema"]["properties"]["steps"]["maxItems"] == 128
+    for launch_name in ("launch_app", "open_app", "computer"):
+        assert tools_by_name[launch_name]["inputSchema"]["properties"]["workspace"]["type"] == ["string", "integer"]
     assert tools_by_name["launch_app"]["inputSchema"]["properties"]["url"]["type"] == "string"
     assert tools_by_name["launch_app"]["inputSchema"]["properties"]["new_window"]["default"] is True
     assert tools_by_name["launch_app"]["inputSchema"]["properties"]["reuse_existing"]["default"] is True

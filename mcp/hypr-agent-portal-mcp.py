@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import base64
 import copy
+import contextvars
+import functools
 import hashlib
 import json
 import math
@@ -42,7 +44,7 @@ from security_policy import (
     policy_from_env,
 )
 from action_sequence import CancellationToken, run_action_sequence
-from hypr_management import HyprManagement, normalize_workspace
+from hypr_management import HyprManagement, normalize_workspace, workspace_matches
 from hypr_socket2 import wait_for_close as socket2_wait_for_close
 from hypr_socket2 import wait_for_window as socket2_wait_for_window
 from hypr_socket2 import sanitize_event_result
@@ -456,6 +458,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             "command": string_property("Full command line to launch. Prefer app unless custom arguments are needed."),
             "args": {"type": "array", "items": {"type": "string"}, "description": "Additional command arguments."},
             "url": string_property("Optional URL or file target to pass to the launched app."),
+            "workspace": {"type": ["string", "integer"], "description": "Numbered workspace id, name, or special:<name>. Launch silently without switching workspace or focus; reused windows are left in place."},
             "new_window": {"type": "boolean", "default": True, "description": "For browsers, request a new window and open about:blank when no URL is supplied. Use only when launching a new browser window is intended."},
             "reuse_existing": {"type": "boolean", "default": True, "description": "Return an already running matching app instead of launching another copy. Set false only when the user explicitly asks for a new instance/window."},
             "timeout": timeout_property("Seconds to wait for a Hyprland window to appear. Defaults to 8; capped at 30."),
@@ -1414,7 +1417,9 @@ def session_action(action: str, target: str) -> dict[str, Any]:
 def sync_related_session(target: str, session_info: dict[str, Any]) -> list[dict[str, Any]]:
     session_info["sync"] = session_action("sync", target)
     try:
-        return related_popups_for(target)
+        return [window for window in privacy_filtered_related_windows(related_windows_for(target))
+                if window.get("hyprAgentPortalRelation") == "related"
+                and window.get("mapped", True) and not window.get("hidden", False)]
     except Exception as exc:
         session_info["relatedError"] = str(exc)
         return []
@@ -1436,6 +1441,72 @@ def finish_related_action_session(target: str, session_info: dict[str, Any]) -> 
     if not related_windows:
         session_info["end"] = session_action("end", target)
     return related_windows
+
+
+# A context-local transaction shares the guard across nested semantic/compatibility
+# handlers. Snapshot generation completes it before observing related windows.
+RELATED_INPUT_SESSION: contextvars.ContextVar[Any] = contextvars.ContextVar("related_input_session", default=None)
+
+
+def complete_related_input_session() -> dict[str, Any] | None:
+    state = RELATED_INPUT_SESSION.get()
+    if state is None:
+        return None
+    if not state["finished"]:
+        state["finished"] = True
+        state["related"] = finish_related_action_session(state["target"], state["session"])
+    return state
+
+
+def run_related_input(target: str, action: Any) -> dict[str, Any]:
+    if RELATED_INPUT_SESSION.get() is not None:
+        return action()
+    try:
+        before_windows = privacy_filtered_related_windows(related_windows_for(target))
+    except Exception:
+        before_windows = []
+    before_window = next((window for window in before_windows if window.get("hyprAgentPortalRelation") == "self"), {})
+    before = {"target": target, "window": before_window, "app": {"pid": before_window.get("pid")}, "relatedWindows": before_windows}
+    state = {"target": target, "session": begin_related_action_session(target), "finished": False, "related": []}
+    token = RELATED_INPUT_SESSION.set(state)
+    try:
+        result = action()
+        complete_related_input_session()
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            structured["session"] = state["session"]
+            structured.setdefault("relatedWindows", state["related"])
+            # Low-level input and paste results retain their operation fields,
+            # but use the semantic snapshot/continuation path for popup changes.
+            if "window" not in structured:
+                closed = False
+                if before_window:
+                    try:
+                        resolve_hypr_window(target)
+                    except Exception as exc:
+                        if not is_app_not_found_error(exc):
+                            raise
+                        closed = True
+                if closed or active_related_windows(state["related"]):
+                    after = snapshot_after_action(target, before, structured)
+                    result = mcp_snapshot_result({**structured, **after})
+                    result["structuredContent"]["session"] = state["session"]
+                else:
+                    result["content"] = [{"type": "text", "text": json.dumps(structured, ensure_ascii=False)}]
+        return result
+    finally:
+        try:
+            complete_related_input_session()
+        finally:
+            RELATED_INPUT_SESSION.reset(token)
+
+
+def related_input_action(action: Any) -> Any:
+    @functools.wraps(action)
+    def guarded(args: dict[str, Any]) -> dict[str, Any]:
+        target = str(current_snapshot(str(args.get("app") or ""))["target"])
+        return run_related_input(target, lambda: action(args))
+    return guarded
 
 
 def normalize(value: Any) -> str:
@@ -1636,15 +1707,17 @@ def launch_command_string(parts: list[str]) -> str:
     return shlex.join([*env_parts, *parts])
 
 
-def hyprctl_exec(command: str) -> str:
+def hyprctl_exec(command: str, workspace: str | None = None) -> str:
     hyprctl = shutil.which("hyprctl")
     if not hyprctl:
         raise RuntimeError("hyprctl not found")
     env = hyprctl_environment()
     if is_lua_config_provider():
-        dispatch_args = [hyprctl, "dispatch", f"hl.dsp.exec_cmd({lua_quote(command)})"]
+        rules = f", {{ workspace = {lua_quote(workspace + ' silent')}, no_focus = true }}" if workspace is not None else ""
+        dispatch_args = [hyprctl, "dispatch", f"hl.dsp.exec_cmd({lua_quote(command)}{rules})"]
     else:
-        dispatch_args = [hyprctl, "dispatch", "exec", command]
+        ruled_command = f"[workspace {workspace} silent; no_focus 1] {command}" if workspace is not None else command
+        dispatch_args = [hyprctl, "dispatch", "exec", ruled_command]
     try:
         proc = subprocess.run(
             dispatch_args,
@@ -4130,7 +4203,7 @@ def key_from_args(args: dict[str, Any]) -> tuple[str, str]:
     return key, modifiers
 
 
-def paste(
+def _paste(
     target: str,
     args: dict[str, Any],
     methods: list[str],
@@ -4144,12 +4217,9 @@ def paste(
     if target_for_input is None:
         prefer_related = args.get("prefer_related")
         target_for_input, related = prefer_related_target(target, False if not isinstance(prefer_related, bool) else prefer_related)
-    session_info: dict[str, Any] = {"begin": session_action("begin", target), "sync": None, "end": None, "active": False}
     time.sleep(0.08)
     key_info = keyboard(target_for_input, "v", "ctrl", float(x) if isinstance(x, (int, float)) else None, float(y) if isinstance(y, (int, float)) else None)
-
     time.sleep(0.12)
-    related_windows = sync_related_session(target, session_info)
 
     restore_info: dict[str, Any] = {"methods": [], "checks": [], "verified": False}
     should_restore = args.get("restore_clipboard", False)
@@ -4160,10 +4230,9 @@ def paste(
         time.sleep(max(0.0, min(float(delay), 5.0)))
         restore_info = restore_clipboard_text(text_clipboard_snapshot)
 
-    related_windows = sync_related_session(target, session_info)
-    session_info["active"] = bool(related_windows)
-    if not related_windows:
-        session_info["end"] = session_action("end", target)
+    state = complete_related_input_session()
+    session_info = state["session"] if state is not None else {}
+    related_windows = state["related"] if state is not None else []
 
     next_step = None
     if related_windows:
@@ -4188,6 +4257,11 @@ def paste(
         "clipboardRestore": restore_info["methods"],
         "clipboardRestoreChecks": restore_info["checks"],
     }
+
+
+def paste(target: str, args: dict[str, Any], methods: list[str], **options: Any) -> dict[str, Any]:
+    result = run_related_input(target, lambda: result_text(_paste(target, args, methods, **options)))
+    return result["structuredContent"]
 
 
 def type_text(target: str, text: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -4443,6 +4517,9 @@ def merge_last_action(after: dict[str, Any], before: dict[str, Any], action_resu
 
 
 def snapshot_after_action(app: str, before: dict[str, Any], action_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    state = complete_related_input_session()
+    if state is not None:
+        action_result = {**(action_result or {}), "session": state["session"]}
     if action_result:
         time.sleep(0.35)
     try:
@@ -4674,34 +4751,76 @@ def require_safe_full_capture(target: Any) -> None:
         )
 
 
+def launch_active_state() -> dict[str, Any]:
+    hyprctl = shutil.which("hyprctl")
+    if not hyprctl:
+        raise RuntimeError("hyprctl not found")
+    state = {}
+    for query, key in (("activeworkspace", "workspace"), ("activewindow", "window")):
+        proc = subprocess.run([hyprctl, query, "-j"], text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env=hyprctl_environment(), check=False, timeout=MAX_TOOL_WAIT_SECONDS)
+        if proc.returncode:
+            raise RuntimeError(proc.stderr or proc.stdout or f"hyprctl {query} failed")
+        value = json.loads(proc.stdout)
+        state[key] = {"id": value.get("id"), "name": value.get("name")} if key == "workspace" else {"address": value.get("address"), "pid": value.get("pid")}
+    return state
+
+
 def tool_launch_app(args: dict[str, Any]) -> dict[str, Any]:
     parts, match_query = launch_parts(args)
+    workspace = None
+    if "workspace" in args:
+        if isinstance(args["workspace"], bool) or not isinstance(args["workspace"], (str, int)):
+            raise RuntimeError("workspace must be a string or integer")
+        workspace = normalize_workspace(args["workspace"])
+        if any(char in workspace for char in "[]"):
+            raise RuntimeError("workspace must not contain exec-rule delimiters")
     reuse_existing = args.get("reuse_existing")
     if not isinstance(reuse_existing, bool):
         reuse_existing = True
     timeout = bounded_timeout_seconds(args.get("timeout", 8), 8.0)
 
+    if workspace is not None:
+        active_before = launch_active_state()
+
+    existing = None
     if reuse_existing:
         try:
             existing = resolve_hypr_window(match_query)
-            result = {
-                "ok": True,
-                "reused": True,
-                "app": match_query,
-                "target": window_selector(existing),
-                "window": existing,
-                "next": f'Call get_app_state with app="{window_selector(existing)}" or app="{match_query}".',
-            }
-            if SECURITY_POLICY.privacy_excluded(existing):
-                result = {"ok": True, "reused": True, "privacyExcluded": True}
-            return mcp_text(json.dumps(result, ensure_ascii=False), structured=result)
         except Exception:
             pass
+    if existing is not None:
+        result = {
+            "ok": True,
+            "reused": True,
+            "app": match_query,
+            "target": window_selector(existing),
+            "window": existing,
+            "next": f'Call get_app_state with app="{window_selector(existing)}" or app="{match_query}".',
+        }
+        if SECURITY_POLICY.privacy_excluded(existing):
+            result = {"ok": True, "reused": True, "privacyExcluded": True}
+        else:
+            result["session"] = session_action("begin", window_selector(existing))
+            result["workspace"] = existing.get("workspace")
+            if workspace is not None:
+                result["placement"] = "reused-existing"
+                result["requestedWorkspace"] = workspace
+                active_after = launch_active_state()
+                result.update({"activeWorkspaceBefore": active_before["workspace"], "activeWorkspaceAfter": active_after["workspace"],
+                               "activeWindowBefore": active_before["window"], "activeWindowAfter": active_after["window"],
+                               "activeWorkspaceChanged": active_before["workspace"] != active_after["workspace"],
+                               "focusMoved": active_before["window"] != active_after["window"],
+                               "workspaceVerified": workspace_matches(existing.get("workspace") or {}, workspace)})
+                result["ok"] = not result["activeWorkspaceChanged"] and not result["focusMoved"]
+        return mcp_text(json.dumps(result, ensure_ascii=False), structured=result)
 
     before = list_hypr_windows()
     before_ids = window_identities(before)
     command = launch_command_string(parts)
-    output = hyprctl_exec(command)
+    if workspace is not None:
+        require_resulting_workspace_scope(workspace)
+    output = hyprctl_exec(command, workspace) if workspace is not None else hyprctl_exec(command)
     window, new_windows = wait_for_launch_window(before_ids, match_query, timeout, allow_existing_fallback=reuse_existing)
     result: dict[str, Any] = {
         "ok": True,
@@ -4721,10 +4840,29 @@ def tool_launch_app(args: dict[str, Any]) -> dict[str, Any]:
             result = {"ok": True, "reused": False, "privacyExcluded": True}
         else:
             result["target"] = window_selector(window)
+            result["session"] = session_action("begin", window_selector(window))
+            # Read back placement after mapping/session sync, not the launch poll.
+            window = resolve_hypr_window(window_selector(window))
             result["window"] = window
+            result["workspace"] = window.get("workspace")
             result["next"] = f'Call get_app_state with app="{window_selector(window)}" or app="{match_query}".'
     else:
         result["warning"] = "No Hyprland window appeared before timeout; use list_apps to inspect current windows."
+    if workspace is not None and not result.get("privacyExcluded"):
+        result.setdefault("workspace", None)
+        active_after = launch_active_state()
+        placement_ok = window is not None and workspace_matches(window.get("workspace") or {}, workspace)
+        result.update({
+            "placement": "exec-rule", "requestedWorkspace": workspace,
+            "activeWorkspaceBefore": active_before["workspace"], "activeWorkspaceAfter": active_after["workspace"],
+            "activeWindowBefore": active_before["window"], "activeWindowAfter": active_after["window"],
+            "activeWorkspaceChanged": active_before["workspace"] != active_after["workspace"],
+            "focusMoved": active_before["window"] != active_after["window"],
+            "workspaceVerified": placement_ok,
+        })
+        result["ok"] = bool(placement_ok and not result["activeWorkspaceChanged"] and not result["focusMoved"])
+        if not result["ok"]:
+            result["warning"] = "Workspace launch post-check failed; inspect placement and active-state fields."
     return mcp_text(json.dumps(result, ensure_ascii=False), structured=result)
 
 
@@ -4843,6 +4981,7 @@ def tool_get_cursor_position(args: dict[str, Any]) -> dict[str, Any]:
     return mcp_text(json.dumps(result, ensure_ascii=False), structured=result)
 
 
+@related_input_action
 def semantic_click(args: dict[str, Any]) -> dict[str, Any]:
     app = str(args.get("app") or "")
     button = str(args.get("mouse_button") or "left")
@@ -4862,7 +5001,6 @@ def semantic_click(args: dict[str, Any]) -> dict[str, Any]:
         coordinate_space = args.get("coordinate_space") or "screenshot"
 
     target = str(snapshot["target"])
-    session_info = begin_related_action_session(target)
 
     if element is not None and button == "left" and click_count == 1:
         mode = element_click_mode(args)
@@ -4875,10 +5013,9 @@ def semantic_click(args: dict[str, Any]) -> dict[str, Any]:
             else:
                 control_overlay(snapshot, float(x), float(y), coordinate_space=coordinate_space, action="click")
                 if atspi_do_action_isolated(snapshot, element):
-                    action_result = {"method": "atspi", "clickedElement": compact_element_info(element, float(x), float(y), coordinate_space), "session": session_info}
+                    action_result = {"method": "atspi", "clickedElement": compact_element_info(element, float(x), float(y), coordinate_space)}
                     if refresh_info:
                         action_result.update(refresh_info)
-                    finish_related_action_session(target, session_info)
                     return mcp_snapshot_result(
                         snapshot_after_action(
                             app,
@@ -4887,7 +5024,6 @@ def semantic_click(args: dict[str, Any]) -> dict[str, Any]:
                         )
                     )
                 if mode == "atspi":
-                    finish_related_action_session(target, session_info)
                     raise RuntimeError("AT-SPI element action failed; use element_click_mode=pointer for native pointer click")
 
     action = "doubleclick" if click_count > 1 and button == "left" else "click"
@@ -4912,42 +5048,36 @@ def semantic_click(args: dict[str, Any]) -> dict[str, Any]:
             time.sleep(0.12)
     if action == "doubleclick":
         call_ctl(ctl_args)
-    finish_related_action_session(target, session_info)
-    info["session"] = session_info
     return mcp_snapshot_result(snapshot_after_action(app, snapshot, info))
 
 
+@related_input_action
 def semantic_perform_secondary_action(args: dict[str, Any]) -> dict[str, Any]:
     app = str(args.get("app") or "")
     action = str(args.get("action") or "")
     if not action:
         raise RuntimeError("Missing required argument: action")
     snapshot, element, refresh_info = element_snapshot_for_action(app, str(args.get("element_index") or ""))
-    target = str(snapshot["target"])
-    session_info = begin_related_action_session(target)
     try:
         x, y = visible_element_center(snapshot, element)
         control_overlay(snapshot, x, y, action=action)
     except Exception:
         control_overlay(snapshot, action=action)
     if not atspi_do_action_isolated(snapshot, element, action):
-        finish_related_action_session(target, session_info)
         raise RuntimeError(f"{action} is not a valid secondary action for element")
-    finish_related_action_session(target, session_info)
-    info = {"method": "atspi", "action": action, "session": session_info}
+    info = {"method": "atspi", "action": action}
     if refresh_info:
         info.update(refresh_info)
     return mcp_snapshot_result(snapshot_after_action(app, snapshot, info))
 
 
+@related_input_action
 def semantic_activate_menu_item(args: dict[str, Any]) -> dict[str, Any]:
     app = str(args.get("app") or "")
     menu_index = str(args.get("menu_index") or args.get("menuIndex") or "")
     if not menu_index:
         raise RuntimeError("activate_menu_item requires menu_index from get_app_state")
     snapshot = current_snapshot(app)
-    target = str(snapshot["target"])
-    session_info = begin_related_action_session(target)
     item = find_global_menu_item(snapshot, menu_index)
     provider = str(item.get("provider") or "")
     if provider == "dbusmenu":
@@ -4955,14 +5085,12 @@ def semantic_activate_menu_item(args: dict[str, Any]) -> dict[str, Any]:
     elif provider == "gmenu":
         result = activate_gmenu_item(item)
     else:
-        finish_related_action_session(target, session_info)
         raise RuntimeError(f"unsupported global menu provider: {provider}")
     time.sleep(0.12)
-    finish_related_action_session(target, session_info)
-    result["session"] = session_info
     return mcp_snapshot_result(snapshot_after_action(app, snapshot, result))
 
 
+@related_input_action
 def semantic_scroll(args: dict[str, Any]) -> dict[str, Any]:
     app = str(args.get("app") or "")
     direction = str(args.get("direction") or "down").lower()
@@ -5024,6 +5152,7 @@ def semantic_scroll(args: dict[str, Any]) -> dict[str, Any]:
         return mcp_snapshot_result(snapshot_after_action(app, snapshot, action_result))
 
 
+@related_input_action
 def semantic_drag(args: dict[str, Any]) -> dict[str, Any]:
     app = str(args.get("app") or "")
     snapshot = current_snapshot(app)
@@ -5068,6 +5197,7 @@ def semantic_drag(args: dict[str, Any]) -> dict[str, Any]:
     return mcp_snapshot_result(snapshot_after_action(app, snapshot, action_result))
 
 
+@related_input_action
 def semantic_hover(args: dict[str, Any]) -> dict[str, Any]:
     app = str(args.get("app") or "")
     element_index = args.get("element_index")
@@ -5088,6 +5218,7 @@ def semantic_hover(args: dict[str, Any]) -> dict[str, Any]:
     return mcp_snapshot_result(snapshot_after_action(app, snapshot, action_result))
 
 
+@related_input_action
 def semantic_type_text(args: dict[str, Any]) -> dict[str, Any]:
     app = str(args.get("app") or "")
     text = args.get("text")
@@ -5117,6 +5248,7 @@ def semantic_type_text(args: dict[str, Any]) -> dict[str, Any]:
     return mcp_snapshot_result(snapshot_after_action(app, snapshot, info))
 
 
+@related_input_action
 def semantic_paste_text(args: dict[str, Any]) -> dict[str, Any]:
     app = str(args.get("app") or "")
     text = args.get("text")
@@ -5134,9 +5266,10 @@ def semantic_paste_text(args: dict[str, Any]) -> dict[str, Any]:
     info = paste(target, args, methods, text_clipboard_snapshot=clipboard, target_for_input=target_for_input, related=related)
     if prepare_info is not None:
         info["preparedForGridPaste"] = {"escape": prepare_info}
-    return result_text(info)
+    return mcp_snapshot_result(snapshot_after_action(app, snapshot, info))
 
 
+@related_input_action
 def semantic_press_key(args: dict[str, Any]) -> dict[str, Any]:
     app = str(args.get("app") or "")
     snapshot = current_snapshot(app)
@@ -5163,6 +5296,7 @@ def semantic_press_key(args: dict[str, Any]) -> dict[str, Any]:
     return mcp_snapshot_result(snapshot_after_action(app, snapshot, info if info else None))
 
 
+@related_input_action
 def semantic_set_value(args: dict[str, Any]) -> dict[str, Any]:
     app = str(args.get("app") or "")
     value = args.get("value")
@@ -6156,6 +6290,16 @@ SEMANTIC_TOOLS = {
 
 def computer(args: dict[str, Any]) -> dict[str, Any]:
     action = str(args.get("action") or "")
+    input_actions = {"move", "click", "doubleclick", "press", "release", "scroll", "drag", "key", "type",
+                     "left_click", "right_click", "middle_click", "double_click", "triple_click", "hover", "left_click_drag",
+                     "paste_text", "paste_file", "paste_image"}
+    if action in input_actions:
+        return run_related_input(require_target(args), lambda: _computer(args))
+    return _computer(args)
+
+
+def _computer(args: dict[str, Any]) -> dict[str, Any]:
+    action = str(args.get("action") or "")
 
     richer = {
         "set_value": semantic_set_value,
@@ -6885,7 +7029,9 @@ def workspace_identity_value(workspace: Any) -> str:
 def resulting_scope_targets(action: str, args: dict[str, Any], source: WindowIdentity | None) -> tuple[WindowIdentity, ...]:
     """Project destination identities so dry-run and execution share policy."""
     destination: Any = None
-    if action == "manage_window":
+    if action in {"launch", "launch_app", "open_app"}:
+        destination = args.get("workspace")
+    elif action == "manage_window":
         operation = str(args.get("window_action") or args.get("action") or "").casefold()
         if operation == "move_to_workspace":
             destination = args.get("workspace")

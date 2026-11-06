@@ -539,5 +539,69 @@ class HyprManagementTests(unittest.TestCase):
         )
 
 
+class WorkspaceLaunchTests(unittest.TestCase):
+    def server(self):
+        spec = importlib.util.spec_from_file_location("portal_launch_management_test", ROOT / "mcp" / "hypr-agent-portal-mcp.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_exec_rules_are_provider_aware_and_quoted(self):
+        module = self.server()
+        for provider in (False, True):
+            for workspace in ("19", "name:agent", "special:agent"):
+                calls = []
+                def run(argv, **kwargs):
+                    calls.append(argv)
+                    return __import__("subprocess").CompletedProcess(argv, 0, "ok", "")
+                with mock.patch.object(module.shutil, "which", return_value="hyprctl"), mock.patch.object(module, "is_lua_config_provider", return_value=provider), mock.patch.object(module.subprocess, "run", side_effect=run):
+                    module.hyprctl_exec("kitty --title 'test'", workspace)
+                if provider:
+                    self.assertEqual(calls, [["hyprctl", "dispatch", f'hl.dsp.exec_cmd("kitty --title \'test\'", {{ workspace = "{workspace} silent", no_focus = true }})']])
+                else:
+                    self.assertEqual(calls, [["hyprctl", "dispatch", "exec", f"[workspace {workspace} silent; no_focus 1] kitty --title 'test'"]])
+
+    def test_launch_postchecks_workspace_focus_and_begins_session(self):
+        module = self.server()
+        window = {"address": "launch-fixture", "class": "kitty", "workspace": {"id": 19, "name": "19"}}
+        active = {"workspace": {"id": 1, "name": "1"}, "window": {"address": "human", "pid": 2}}
+        with mock.patch.object(module, "list_hypr_windows", return_value=[]), mock.patch.object(module, "wait_for_launch_window", return_value=(window, [window])), mock.patch.object(module, "resolve_hypr_window", return_value=window), mock.patch.object(module, "launch_active_state", return_value=active), mock.patch.object(module, "hyprctl_exec", return_value="ok") as execute, mock.patch.object(module, "session_action", return_value={"ok": True}) as session:
+            result = module.tool_launch_app({"command": "kitty", "workspace": 19, "reuse_existing": False})["structuredContent"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(execute.call_args.args[1], "19")
+        self.assertEqual(result["placement"], "exec-rule")
+        self.assertEqual(result["workspace"], window["workspace"])
+        self.assertTrue(result["workspaceVerified"])
+        self.assertFalse(result["activeWorkspaceChanged"])
+        self.assertFalse(result["focusMoved"])
+        session.assert_called_once_with("begin", "address:launch-fixture")
+
+    def test_reuse_keeps_window_in_place_and_reports_active_state(self):
+        module = self.server()
+        window = {"address": "launch-fixture", "class": "kitty", "workspace": {"id": 7, "name": "7"}}
+        active = {"workspace": {"id": 1, "name": "1"}, "window": {"address": "human", "pid": 2}}
+        with mock.patch.object(module, "resolve_hypr_window", return_value=window), mock.patch.object(module, "launch_active_state", return_value=active), mock.patch.object(module, "hyprctl_exec") as execute, mock.patch.object(module, "session_action", return_value={"ok": True}) as session:
+            result = module.tool_launch_app({"command": "kitty", "workspace": 19})["structuredContent"]
+        execute.assert_not_called()
+        session.assert_called_once_with("begin", "address:launch-fixture")
+        self.assertTrue(result["reused"])
+        self.assertEqual(result["placement"], "reused-existing")
+        self.assertEqual(result["workspace"]["id"], 7)
+        self.assertFalse(result["activeWorkspaceChanged"])
+        self.assertFalse(result["focusMoved"])
+
+    def test_launch_failed_postcheck_is_explicit(self):
+        module = self.server()
+        window = {"address": "launch-fixture", "class": "kitty", "workspace": {"id": 1, "name": "1"}}
+        states = [{"workspace": {"id": 1}, "window": {"address": "human"}}, {"workspace": {"id": 19}, "window": {"address": "launch-fixture"}}]
+        with mock.patch.object(module, "list_hypr_windows", return_value=[]), mock.patch.object(module, "wait_for_launch_window", return_value=(window, [window])), mock.patch.object(module, "resolve_hypr_window", return_value=window), mock.patch.object(module, "launch_active_state", side_effect=states), mock.patch.object(module, "hyprctl_exec", return_value="ok"), mock.patch.object(module, "session_action", return_value={"ok": True}):
+            result = module.tool_launch_app({"command": "kitty", "workspace": 19, "reuse_existing": False})["structuredContent"]
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["workspaceVerified"])
+        self.assertTrue(result["activeWorkspaceChanged"])
+        self.assertTrue(result["focusMoved"])
+
+
 if __name__ == "__main__":
     unittest.main()

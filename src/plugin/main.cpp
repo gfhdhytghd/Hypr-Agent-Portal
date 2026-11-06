@@ -2980,11 +2980,30 @@ int luaDispatchClosure(lua_State* L) {
     return pushLuaDispatchResult(L, dispatchLuaPayload(dispatcher, payload));
 }
 
+const char* luaDispatcherName(eLuaDispatcher dispatcher) {
+    switch (dispatcher) {
+        case eLuaDispatcher::POINTER: return "hypr-agent-portal:pointer";
+        case eLuaDispatcher::POINTER_RELATIVE: return "hypr-agent-portal:pointer-relative";
+        case eLuaDispatcher::INDICATOR: return "hypr-agent-portal:indicator";
+        case eLuaDispatcher::INDICATOR_END: return "hypr-agent-portal:indicator-end";
+        case eLuaDispatcher::KEYBOARD: return "hypr-agent-portal:keyboard";
+        case eLuaDispatcher::SCREENSHOT: return "hypr-agent-portal:screenshot";
+        case eLuaDispatcher::SESSION: return "hypr-agent-portal:session";
+        case eLuaDispatcher::MANAGE: return "hypr-agent-portal:manage";
+        case eLuaDispatcher::PANIC: return "hypr-agent-portal:panic";
+        case eLuaDispatcher::GUARD: return "hypr-agent-portal:guard";
+        case eLuaDispatcher::APPROVAL: return "hypr-agent-portal:approval";
+    }
+
+    return "hypr-agent-portal";
+}
+
 int makeLuaDispatcher(lua_State* L, eLuaDispatcher dispatcher) {
     const auto* payload = luaL_checkstring(L, 1);
     lua_pushinteger(L, static_cast<lua_Integer>(dispatcher));
     lua_pushstring(L, payload ? payload : "");
     lua_pushcclosure(L, luaDispatchClosure, 2);
+    lua_pushstring(L, luaDispatcherName(dispatcher));
     return Config::Lua::Bindings::Internal::wrapDispatcher(L);
 }
 

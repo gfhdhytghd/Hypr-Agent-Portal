@@ -85,6 +85,8 @@ def test_semantic_text_routing(mcp) -> None:
     }
     calls: list[str] = []
     originals = {
+        "session_action": mcp.session_action,
+        "related_windows_for": mcp.related_windows_for,
         "current_snapshot": mcp.current_snapshot,
         "control_overlay": mcp.control_overlay,
         "atspi_insert_focused_text_isolated": mcp.atspi_insert_focused_text_isolated,
@@ -95,6 +97,8 @@ def test_semantic_text_routing(mcp) -> None:
         "mcp_snapshot_result": mcp.mcp_snapshot_result,
     }
     try:
+        mcp.session_action = lambda *_args: {"ok": True}
+        mcp.related_windows_for = lambda _target: []
         mcp.current_snapshot = lambda _app: focused_snapshot
         mcp.control_overlay = lambda *_args, **_kwargs: None
         mcp.prepare_grid_bulk_paste = lambda *_args, **_kwargs: None

@@ -2373,7 +2373,91 @@ def test_mcp_workspace_semantics_match_direct_and_computer_handlers() -> None:
     ]
 
 
+
+def test_mcp_input_sessions_wrap_semantic_and_compatibility_actions() -> None:
+    module = load_path(MCP, "input_sessions")
+    target = "address:session-fixture"
+    snapshot = {"target": target, "window": {"address": "session-fixture"}, "elements": []}
+    module.current_snapshot = lambda _app: snapshot
+    module.resolve_hypr_window = lambda _app: snapshot["window"]
+    module.control_overlay = lambda *_args, **_kwargs: None
+    module.best_scroll_element = lambda *_args: None
+    module.time = __import__("types").SimpleNamespace(sleep=lambda _seconds: None)
+    events = []
+    module.session_action = lambda action, selector: events.append(action) or {"ok": True}
+    module.related_windows_for = lambda _target: []
+    module.keyboard = lambda *_args: events.append("act") or {"ok": True}
+    module.type_text = lambda *_args: events.append("act") or {"ok": True}
+    module.snapshot_after_action = lambda _app, before, result: {**before, "lastAction": result}
+    for action, arguments in (
+        (module.semantic_press_key, {"app": target, "key": "enter"}),
+        (module.semantic_type_text, {"app": target, "text": "hello", "method": "keys"}),
+        (module.computer, {"action": "key", "target": target, "key": "enter"}),
+        (module.computer, {"action": "type", "target": target, "text": "hello", "method": "keys"}),
+        (module.computer, {"action": "key", "app": target, "key": "enter"}),
+    ):
+        events.clear()
+        result = action(arguments)
+        assert events[0] == "begin" and events[1] == "act" and events[-1] == "end", events
+        assert "sync" in events and events.count("begin") == 1 and events.count("end") == 1, events
+        assert result["structuredContent"]["session"]["end"]["ok"]
+        assert module.RELATED_INPUT_SESSION.get() is None
+    events.clear()
+    module.keyboard = lambda *_args: (_ for _ in ()).throw(RuntimeError("input failed"))
+    try:
+        module.semantic_press_key({"app": target, "key": "enter"})
+        raise AssertionError("expected failed input")
+    except RuntimeError as exc:
+        assert str(exc) == "input failed"
+    assert events[0] == "begin" and events[-1] == "end", events
+    assert module.RELATED_INPUT_SESSION.get() is None
+
+
+
+def test_mcp_raw_input_closed_popup_continues_with_root() -> None:
+    module = load_path(MCP, "raw_closed_popup_session")
+    module.time = __import__("types").SimpleNamespace(sleep=lambda _seconds: None)
+    root = {"address": "root-fixture", "pid": 123, "processStartTime": "456", "class": "app", "workspace": {"name": "19"}, "hyprAgentPortalRelation": "related"}
+    popup = {**root, "address": "popup-fixture", "hyprAgentPortalRelation": "self", "floating": True}
+    opened = True
+    module.session_action = lambda *_args: {"ok": True}
+    module.related_windows_for = lambda _target: [popup, root] if opened else []
+    def resolve(selector):
+        if "popup-fixture" in selector:
+            if opened:
+                return popup
+            raise RuntimeError('appNotFound("popup")')
+        return root
+    module.resolve_hypr_window = resolve
+    module.list_hypr_windows = lambda: [root]
+    def snapshot(selector):
+        window = resolve(selector)
+        return {"app": {"name": "app", "pid": 123}, "target": "address:root-fixture", "window": window, "relatedWindows": [root], "elements": []}
+    module.build_app_snapshot = snapshot
+    def keyboard(*_args):
+        nonlocal opened
+        opened = False
+        return {"ok": True}
+    module.keyboard = keyboard
+    result = module.computer({"action": "key", "target": "address:popup-fixture", "key": "escape"})
+    info = result["structuredContent"]
+    assert info["lastAction"]["targetClosed"] is True
+    assert info["lastAction"]["continuedWithTarget"] == "address:root-fixture"
+    assert "ACTION RESULT:" in result["content"][0]["text"]
+    assert module.RELATED_INPUT_SESSION.get() is None
+
+def test_mcp_workspace_launch_destination_is_checked_in_preflight() -> None:
+    with security_environment(SECURITY_CONFINE_WORKSPACES="19"):
+        module = load_path(MCP, "launch_workspace_policy")
+    for name, args in (("launch_app", {"app": "kitty", "workspace": 20}), ("computer", {"action": "launch_app", "app": "kitty", "workspace": 20})):
+        request = module.build_security_request(name, args)
+        assert request.scope_targets[0].workspace == "20"
+        assert not module.SECURITY_POLICY.evaluate(request).allowed
+
 TESTS = [
+    test_mcp_input_sessions_wrap_semantic_and_compatibility_actions,
+    test_mcp_raw_input_closed_popup_continues_with_root,
+    test_mcp_workspace_launch_destination_is_checked_in_preflight,
     test_policy_is_disabled_by_default_and_can_be_enabled,
     test_policy_readonly_and_dry_run,
     test_policy_confinement,

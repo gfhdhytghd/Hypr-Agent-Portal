@@ -462,7 +462,19 @@ bool renderWindowArtifact(const PHLWINDOW& window,
     const int targetCropX = width < framebufferWidth ? (framebufferWidth - width) / 2 : 0;
     const int targetCropY = height < framebufferHeight ? (framebufferHeight - height) / 2 : 0;
     const Vector2D renderOffset = monitor->m_position + Vector2D{targetCropX / scale, targetCropY / scale} - mainBox.pos();
-    windowGoal.setPositionOffset(renderOffset);
+    auto presentation = window->presentation().renderPresentation();
+    Vector2D workspaceOffset;
+    if (window->m_workspace && !window->m_workspace->visible() && !(window->m_state & Desktop::View::WINDOW_STATE_PINNED)) {
+        // Keep the crop aligned while removing the hidden workspace's presentation.
+        workspaceOffset = presentation.workspaceOffset;
+        presentation.workspaceOffset = {};
+        presentation.workspaceAlpha = 1.F;
+        presentation.alpha = 1.F;
+        presentation.fadeAlpha = 1.F;
+        presentation.workspaceOffsetAnimating = false;
+        presentation.alphaVisible = true;
+    }
+    windowGoal.setPositionOffset(renderOffset + workspaceOffset);
     CBox renderCropBox = mainBox.copy().translate(renderOffset).translate(-monitor->m_position).scale(scale).round();
 
     auto       framebuffer = makeShared<Render::GL::CGLFramebuffer>();
@@ -487,7 +499,7 @@ bool renderWindowArtifact(const PHLWINDOW& window,
         FullSurfaceVisibleRegionOverride fullVisibleRegion(window);
         g_pHyprRenderer->draw(ctx, CClearPassElement::SClearData{CHyprColor{0.0, 0.0, 0.0, 0.0}});
         g_pHyprRenderer->startRenderPass(ctx);
-        g_pHyprRenderer->renderWindow(ctx, window, monitor, window->presentation().renderPresentation(), frozenTime, false, Render::RENDER_PASS_ALL, false, false);
+        g_pHyprRenderer->renderWindow(ctx, window, monitor, presentation, frozenTime, false, Render::RENDER_PASS_ALL, false, false);
     }
     ctx.m_renderingSnapshot = previousRenderingSnapshot;
 

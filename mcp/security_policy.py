@@ -452,8 +452,18 @@ def _challenge_entries_locked(directory_fd: int, now: float) -> list[dict[str, A
     This prevents a same-UID writer from bypassing the global cap, while no
     symlink or non-regular file is ever followed or interpreted.
     """
+    # The caller opened directory_fd before taking the capacity lock. Btrfs
+    # bounds readdir by the last index at open, so that descriptor can miss a
+    # challenge created by the previous lock holder. Open a fresh description
+    # under the lock, relative to the validated directory (dup is not enough).
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    scan_fd = os.open(".", flags, dir_fd=directory_fd)
+    try:
+        filenames = os.listdir(scan_fd)
+    finally:
+        os.close(scan_fd)
     entries: list[dict[str, Any] | None] = []
-    for filename in os.listdir(directory_fd):
+    for filename in filenames:
         parts = filename.split(".")
         if len(parts) != 3 or not _valid_challenge_id(parts[0]) or parts[1] not in {"pending", "approved"} or parts[2] != "json":
             continue

@@ -711,23 +711,43 @@ def test_confirmation_capacity_is_atomic_across_policy_instances() -> None:
             confirmation_pending_per_owner=1,
         )
         policies = [mod.SecurityPolicy(config, confirmation_dir=confirmation_dir) for _ in range(2)]
-        barrier = threading.Barrier(2)
+        directories_opened = threading.Barrier(2)
         outcomes: list[str] = []
+        errors: list[str] = []
+        original_lock = mod._lock_confirmation_directory
+
+        def lock_after_both_directories_open(directory_fd: int) -> int:
+            # Both descriptors must predate the first challenge. Btrfs captures
+            # a readdir index limit at open, even if flock is acquired later.
+            directories_opened.wait(timeout=10)
+            return original_lock(directory_fd)
+
+        mod._lock_confirmation_directory = lock_after_both_directories_open
 
         def create(index: int) -> None:
-            barrier.wait()
             try:
                 policies[index].request_confirmation(request(mod, owner=f"owner-{index}", destructive=True))
                 outcomes.append("created")
-            except RuntimeError:
-                outcomes.append("rejected")
+            except RuntimeError as error:
+                if str(error) == "confirmation challenge capacity exhausted":
+                    outcomes.append("rejected")
+                else:
+                    errors.append(repr(error))
+            except Exception as error:
+                errors.append(repr(error))
 
         threads = [threading.Thread(target=create, args=(index,)) for index in range(2)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(2)
-        assert outcomes.count("created") == 1 and outcomes.count("rejected") == 1
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            assert not any(thread.is_alive() for thread in threads), (outcomes, errors)
+            assert not errors, errors
+            assert outcomes.count("created") == 1 and outcomes.count("rejected") == 1, outcomes
+            assert len(list(confirmation_dir.glob("*.pending.json"))) == 1
+        finally:
+            mod._lock_confirmation_directory = original_lock
 
 
 def test_forged_approved_file_requires_live_native_proof() -> None:

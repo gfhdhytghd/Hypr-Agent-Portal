@@ -4,7 +4,7 @@
 #include <string>
 #include <string_view>
 
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/DesktopTypes.hpp>
 
 namespace hypr_agent_portal {
 

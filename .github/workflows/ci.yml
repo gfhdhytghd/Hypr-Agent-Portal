@@ -120,10 +120,28 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed
           base-devel cmake ninja pkgconf python python-pillow
-          hyprland lua nlohmann-json
+          hyprland lua nlohmann-json git cpio
+          wayland-protocols hyprland-protocols hyprwayland-scanner
+          glslang re2 tomlplusplus
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: hyprwm/Hyprland
+          ref: 11cbc6c577b84ffb1edf4df3fc5b6128c3ae6947 # v0.57.2
+          submodules: recursive
+          path: .ci-hyprland
+      - name: Build pinned Hyprland
+        run: |
+          cmake -S .ci-hyprland -B .ci-hyprland/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/hyprland-v0572
+          cmake --build .ci-hyprland/build --parallel 2
+          cmake --install .ci-hyprland/build
+          echo "PKG_CONFIG_PATH=/opt/hyprland-v0572/share/pkgconfig:/opt/hyprland-v0572/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "/opt/hyprland-v0572/bin" >> "$GITHUB_PATH"
       - name: Verify frozen Hyprland ABI
-        run: test "$(pkg-config --modversion hyprland)" = "0.56.2"
+        run: |
+          test "$(pkg-config --modversion hyprland)" = "0.57.2"
+          test "$(git -C .ci-hyprland rev-parse HEAD)" = "11cbc6c577b84ffb1edf4df3fc5b6128c3ae6947"
       - name: Configure
         run: cmake -S . -B build-ci -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build-type }}
       - name: Build

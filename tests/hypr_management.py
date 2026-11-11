@@ -483,9 +483,10 @@ class HyprManagementTests(unittest.TestCase):
         block = source.split("SDispatchResult dispatchManage", 1)[1].split("SDispatchResult dispatchPanic", 1)[0]
         self.assertIn("!identity.valid || !identity.qualified", block)
         self.assertIn("const PHLWINDOW window = resolveTargetWindow(parts[1]);", block)
-        self.assertIn("window->m_isMapped", block)
-        self.assertIn("runBuiltinDispatcher", block)
-        self.assertNotIn("runBuiltinDispatcher(parts[0]", block)
+        self.assertIn("window->mapped()", block)
+        self.assertIn("Config::Actions::focus(window)", block)
+        self.assertIn("Config::Actions::moveToWorkspace(parts[2], !follow, window)", block)
+        self.assertNotIn("runBuiltinDispatcher", block)
         self.assertIn('"hypr-agent-portal:manage", dispatchManage', source)
         self.assertIn('"hypr-agent-protal:manage", dispatchManage', source)
         self.assertIn('addLuaFunction(g_pluginHandle, name, "manage", luaManage)', source)
@@ -554,7 +555,7 @@ class WorkspaceLaunchTests(unittest.TestCase):
                 def run(argv, **kwargs):
                     calls.append(argv)
                     return __import__("subprocess").CompletedProcess(argv, 0, "ok", "")
-                with mock.patch.object(module.shutil, "which", return_value="hyprctl"), mock.patch.object(module, "is_lua_config_provider", return_value=provider), mock.patch.object(module.subprocess, "run", side_effect=run):
+                with mock.patch.object(module.shutil, "which", return_value="hyprctl"), mock.patch.object(module, "hyprctl_environment", return_value={}), mock.patch.object(module, "is_lua_config_provider", return_value=provider), mock.patch.object(module.subprocess, "run", side_effect=run):
                     module.hyprctl_exec("kitty --title 'test'", workspace)
                 if provider:
                     self.assertEqual(calls, [["hyprctl", "dispatch", f'hl.dsp.exec_cmd("kitty --title \'test\'", {{ workspace = "{workspace} silent", no_focus = true }})']])

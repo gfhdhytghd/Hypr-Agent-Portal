@@ -6,18 +6,23 @@
 #define private public
 #define protected public
 #include <hyprland/src/Compositor.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprland/src/desktop/state/ViewState.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
-#include <hyprland/src/render/OpenGL.hpp>
+#include <hyprland/src/render/GLRenderer.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/gl/GLFramebuffer.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/xwayland/XWayland.hpp>
 #undef protected
 #undef private
+
+#include "plugin/window_backend.hpp"
 
 #include <GLES2/gl2.h>
 #include <drm_fourcc.h>
@@ -249,9 +254,9 @@ class FullSurfaceVisibleRegionOverride {
 };
 
 CBox renderedWindowBox(const PHLWINDOW& window, CBox box) {
-    if (window->m_workspace && !window->m_pinned)
+    if (window->m_workspace && !static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED))
         box.translate(window->m_workspace->m_renderOffset->value());
-    box.translate(window->m_floatingOffset);
+    box.translate(window->presentation().floatingOffset());
     return box;
 }
 
@@ -265,9 +270,9 @@ CBox renderedWindowMainSurfaceBox(const PHLWINDOW& window) {
 }
 
 CBox inputWindowBox(const PHLWINDOW& window, CBox renderedBox) {
-    if (window->m_workspace && !window->m_pinned)
+    if (window->m_workspace && !static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED))
         renderedBox.translate(-window->m_workspace->m_renderOffset->value());
-    renderedBox.translate(-window->m_floatingOffset);
+    renderedBox.translate(-window->presentation().floatingOffset());
     return renderedBox;
 }
 
@@ -289,7 +294,7 @@ class WindowAnimationGoalOverride {
 
         m_window->positionAnimation()->value() = m_window->positionAnimation()->goal() + offset;
         m_window->sizeAnimation()->value() = m_window->sizeAnimation()->goal();
-        m_window->updateWindowDecos();
+        m_window->presentation().updateDecorations();
     }
 
     ~WindowAnimationGoalOverride() {
@@ -298,7 +303,7 @@ class WindowAnimationGoalOverride {
 
         m_window->positionAnimation()->value() = m_position;
         m_window->sizeAnimation()->value() = m_size;
-        m_window->updateWindowDecos();
+        m_window->presentation().updateDecorations();
     }
 
     WindowAnimationGoalOverride(const WindowAnimationGoalOverride&) = delete;
@@ -315,7 +320,8 @@ bool renderMonitorArtifact(const PHLMONITOR& monitor, const Time::steady_tp& fro
     if (!monitor || !monitor->m_activeWorkspace || !g_pHyprRenderer || !g_pHyprOpenGL)
         return false;
 
-    // Capture in logical axes, matching the MCP geometry and click contract.
+    auto& ctx = g_pHyprRenderer->context();
+    // FULL_FAKE exports upright logical-axis pixels on this Hyprland branch.
     width = positiveRoundedIntFromDouble(monitor->m_transformedSize.x);
     height = positiveRoundedIntFromDouble(monitor->m_transformedSize.y);
     std::size_t framebufferBytes = 0;
@@ -327,34 +333,24 @@ bool renderMonitorArtifact(const PHLMONITOR& monitor, const Time::steady_tp& fro
     if (!framebuffer->alloc(width, height, drmFormat) && !framebuffer->alloc(width, height, DRM_FORMAT_ABGR8888))
         return false;
 
-    const bool previousBlockFeedback = g_pHyprRenderer->m_bBlockSurfaceFeedback;
-    const bool previousBlockShader = g_pHyprRenderer->m_renderData.blockScreenShader;
+    const bool previousBlockFeedback = ctx.m_blockSurfaceFeedback;
+    const bool previousBlockShader = ctx.m_data.blockScreenShader;
     CRegion    fakeDamage{0, 0, width, height};
 
     g_pHyprOpenGL->makeEGLCurrent();
-    g_pHyprRenderer->m_bBlockSurfaceFeedback = true;
-    if (!g_pHyprRenderer->beginRender(monitor, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, framebuffer, true)) {
-        g_pHyprRenderer->m_bBlockSurfaceFeedback = previousBlockFeedback;
+    if (!g_pHyprRenderer->beginRender(monitor, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, framebuffer)) {
+        ctx.m_blockSurfaceFeedback = previousBlockFeedback;
         return false;
     }
 
-    // v0.56.2 still projects FULL_FAKE into physical axes by default. Use
-    // the direct framebuffer path and an explicit export projection so output
-    // transforms do not rotate or clip these logical-axis artifacts.
-    g_pHyprRenderer->m_renderData.fbSize = Vector2D{width, height};
-    g_pHyprRenderer->setProjectionType(Render::RPT_EXPORT);
-    g_pHyprRenderer->m_renderData.transformDamage = false;
-    g_pHyprOpenGL->setViewport(0, 0, width, height);
-
-    glClearColor(0.F, 0.F, 0.F, 1.F);
-    glClear(GL_COLOR_BUFFER_BIT);
-    // v0.56.2 validates its 1:1 workspace box in physical axes. Client
-    // geometry stays logical for the explicit export projection.
-    g_pHyprRenderer->renderWorkspace(monitor, monitor->m_activeWorkspace, frozenTime, CBox{0, 0, monitor->m_pixelSize.x, monitor->m_pixelSize.y});
-    g_pHyprRenderer->m_renderData.blockScreenShader = true;
+    ctx.m_blockSurfaceFeedback = true;
+    g_pHyprRenderer->draw(ctx, CClearPassElement::SClearData{CHyprColor{0.0, 0.0, 0.0, 1.0}});
+    g_pHyprRenderer->startRenderPass(ctx);
+    g_pHyprRenderer->renderWorkspace(ctx, monitor, monitor->m_activeWorkspace, frozenTime, CBox{0, 0, static_cast<double>(width), static_cast<double>(height)});
+    ctx.m_data.blockScreenShader = true;
     g_pHyprRenderer->endRender();
-    g_pHyprRenderer->m_renderData.blockScreenShader = previousBlockShader;
-    g_pHyprRenderer->m_bBlockSurfaceFeedback = previousBlockFeedback;
+    ctx.m_data.blockScreenShader = previousBlockShader;
+    ctx.m_blockSurfaceFeedback = previousBlockFeedback;
 
     const auto readback = readRgbaFramebufferRegion(*framebuffer, 0, 0, width, height);
     return !readback.pixels.empty() && writeFileExclusive(path, readback.pixels);
@@ -370,6 +366,7 @@ bool renderWindowArtifact(const PHLWINDOW& window,
     if (!window || !monitor || !g_pHyprRenderer || !g_pHyprOpenGL)
         return false;
 
+    auto& ctx = g_pHyprRenderer->context();
     WindowAnimationGoalOverride windowGoal(window);
     const CBox mainBox = renderedWindowMainSurfaceBox(window);
     CBox sourceCropBox = mainBox.copy().translate(-monitor->m_position).scale(monitor->m_scale <= 0.0 ? 1.0 : monitor->m_scale).round();
@@ -387,7 +384,19 @@ bool renderWindowArtifact(const PHLWINDOW& window,
     const int targetCropX = width < framebufferWidth ? (framebufferWidth - width) / 2 : 0;
     const int targetCropY = height < framebufferHeight ? (framebufferHeight - height) / 2 : 0;
     const Vector2D renderOffset = monitor->m_position + Vector2D{targetCropX / scale, targetCropY / scale} - mainBox.pos();
-    windowGoal.setPositionOffset(renderOffset);
+    auto presentation = window->presentation().renderPresentation();
+    Vector2D workspaceOffset;
+    if (window->m_workspace && !window->m_workspace->visible() && !(window->m_state & Desktop::View::WINDOW_STATE_PINNED)) {
+        // Keep the crop aligned while removing the hidden workspace's presentation.
+        workspaceOffset = presentation.workspaceOffset;
+        presentation.workspaceOffset = {};
+        presentation.workspaceAlpha = 1.F;
+        presentation.alpha = 1.F;
+        presentation.fadeAlpha = 1.F;
+        presentation.workspaceOffsetAnimating = false;
+        presentation.alphaVisible = true;
+    }
+    windowGoal.setPositionOffset(renderOffset + workspaceOffset);
     CBox renderCropBox = mainBox.copy().translate(renderOffset).translate(-monitor->m_position).scale(scale).round();
 
     auto       framebuffer = makeShared<Render::GL::CGLFramebuffer>();
@@ -395,36 +404,31 @@ bool renderWindowArtifact(const PHLWINDOW& window,
     if (!framebuffer->alloc(framebufferWidth, framebufferHeight, DRM_FORMAT_ABGR8888) && !framebuffer->alloc(framebufferWidth, framebufferHeight, drmFormat))
         return false;
 
-    const bool previousBlockFeedback = g_pHyprRenderer->m_bBlockSurfaceFeedback;
-    const bool previousBlockShader = g_pHyprRenderer->m_renderData.blockScreenShader;
-    const bool previousRenderingSnapshot = g_pHyprRenderer->m_bRenderingSnapshot;
+    const bool previousBlockFeedback = ctx.m_blockSurfaceFeedback;
+    const bool previousBlockShader = ctx.m_data.blockScreenShader;
+    const bool previousRenderingSnapshot = ctx.m_renderingSnapshot;
     CRegion    fakeDamage{0, 0, framebufferWidth, framebufferHeight};
 
     g_pHyprOpenGL->makeEGLCurrent();
-    g_pHyprRenderer->m_bBlockSurfaceFeedback = true;
-    if (!g_pHyprRenderer->beginRender(monitor, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, framebuffer, true)) {
-        g_pHyprRenderer->m_bBlockSurfaceFeedback = previousBlockFeedback;
+    if (!g_pHyprRenderer->beginRender(monitor, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, framebuffer)) {
+        ctx.m_blockSurfaceFeedback = previousBlockFeedback;
         return false;
     }
 
-    g_pHyprRenderer->m_renderData.fbSize = Vector2D{framebufferWidth, framebufferHeight};
-    g_pHyprRenderer->setProjectionType(Render::RPT_EXPORT);
-    g_pHyprRenderer->m_renderData.transformDamage = false;
-    g_pHyprOpenGL->setViewport(0, 0, framebufferWidth, framebufferHeight);
-
-    g_pHyprRenderer->m_bRenderingSnapshot = true;
+    ctx.m_blockSurfaceFeedback = true;
+    ctx.m_renderingSnapshot = true;
     {
         FullSurfaceVisibleRegionOverride fullVisibleRegion(window);
-        glClearColor(0.F, 0.F, 0.F, 0.F);
-        glClear(GL_COLOR_BUFFER_BIT);
-        g_pHyprRenderer->renderWindow(window, monitor, frozenTime, false, Render::RENDER_PASS_ALL, false, false);
+        g_pHyprRenderer->draw(ctx, CClearPassElement::SClearData{CHyprColor{0.0, 0.0, 0.0, 0.0}});
+        g_pHyprRenderer->startRenderPass(ctx);
+        g_pHyprRenderer->renderWindow(ctx, window, monitor, presentation, frozenTime, false, Render::RENDER_PASS_ALL, false, false);
     }
-    g_pHyprRenderer->m_bRenderingSnapshot = previousRenderingSnapshot;
+    ctx.m_renderingSnapshot = previousRenderingSnapshot;
 
-    g_pHyprRenderer->m_renderData.blockScreenShader = true;
+    ctx.m_data.blockScreenShader = true;
     g_pHyprRenderer->endRender();
-    g_pHyprRenderer->m_renderData.blockScreenShader = previousBlockShader;
-    g_pHyprRenderer->m_bBlockSurfaceFeedback = previousBlockFeedback;
+    ctx.m_data.blockScreenShader = previousBlockShader;
+    ctx.m_blockSurfaceFeedback = previousBlockFeedback;
 
     const int cropX = clampedIntFromDouble(renderCropBox.x);
     const int cropY = clampedIntFromDouble(renderCropBox.y);
@@ -449,27 +453,27 @@ Json monitorRectJson(const PHLMONITOR& monitor) {
 }
 
 bool isWindowVisible(const PHLWINDOW& window) {
-    if (!window || !window->m_isMapped || window->isHidden() || !window->m_workspace)
+    if (!window || !window->mapped() || window->isHidden() || !window->m_workspace)
         return false;
     if (g_pHyprRenderer)
         return g_pHyprRenderer->shouldRenderWindow(window);
-    return window->m_pinned || window->m_workspace->isVisible();
+    return static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED) || window->m_workspace->visible();
 }
 
 Json windowJson(const PHLWINDOW& window) {
     CBox visible = window->geometricBox(Desktop::View::IGeometric::GEOMETRIC_GOAL);
     const auto full = window->getFullWindowBoundingBox();
-    const auto transientFor = window->m_isX11 ? window->x11Parent() : PHLWINDOW{};
+    const auto transientFor = x11ParentWindow(window);
 
     return Json{
         {"address", "0x" + pointerId(window.get())},
-        {"title", boundedString(window->m_title, 4096)},
-        {"class", boundedString(window->m_class, 4096)},
-        {"initialClass", boundedString(window->m_initialClass, 4096)},
-        {"pid", window->getPID()},
+        {"title", boundedString(window->metadata().title(), 4096)},
+        {"class", boundedString(window->metadata().appID(), 4096)},
+        {"initialClass", boundedString(window->metadata().initialAppID(), 4096)},
+        {"pid", window->backend().pid()},
         {"transientFor", transientFor ? Json("0x" + pointerId(transientFor.get())) : Json(nullptr)},
         {"visible", isWindowVisible(window)},
-        {"xwayland", window->m_isX11},
+        {"xwayland", window->backend().isX11()},
         {"geometry", rectJson(visible)},
         {"fullGeometry", rectJson(full)},
     };
@@ -628,7 +632,7 @@ ScreenshotResult captureScreenshotSession(const std::filesystem::path& outputJso
     const auto frozenTime = Time::steadyNow();
     if (targetWindow) {
         const auto window = targetWindow;
-        if (!window || !window->m_isMapped)
+        if (!window || !window->mapped())
             return {.success = false, .error = "target window not found"};
 
         const auto monitor = window->m_monitor.lock();
@@ -653,7 +657,7 @@ ScreenshotResult captureScreenshotSession(const std::filesystem::path& outputJso
         root["target"]["artifactGeometry"] = rectJson(artifactBox);
         root["target"]["inputGeometry"] = rectJson(inputBox);
         root["monitors"].push_back(Json{
-            {"name", "window:" + boundedString(window->m_title, 4096)},
+            {"name", "window:" + boundedString(window->metadata().title(), 4096)},
             {"geometry", rectJson(inputBox)},
             {"scale", scale},
             {"transform", 0},
@@ -699,7 +703,7 @@ ScreenshotResult captureScreenshotSession(const std::filesystem::path& outputJso
     }
 
     for (const auto& window : Desktop::windowState()->windows()) {
-        if (!window || !window->m_isMapped)
+        if (!window || !window->mapped())
             continue;
         root["windows"].push_back(windowJson(window));
     }

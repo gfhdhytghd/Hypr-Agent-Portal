@@ -129,6 +129,10 @@ install(FILES
 )
 
 if(BUILD_TESTING)
+  add_executable(screenshot_readback_unit tests/test_screenshot_readback.cpp)
+  target_include_directories(screenshot_readback_unit PRIVATE src)
+  target_compile_options(screenshot_readback_unit PRIVATE -UNDEBUG)
+  add_test(NAME hypr-agent-portal-screenshot-readback-unit COMMAND screenshot_readback_unit)
   add_executable(cursor_visual_unit tests/test_cursor_visual.cpp)
   target_include_directories(cursor_visual_unit PRIVATE src)
   target_compile_options(cursor_visual_unit PRIVATE -UNDEBUG)
@@ -136,6 +140,8 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING AND Python3_Interpreter_FOUND)
+  add_test(NAME hypr-agent-portal-screenshot-transforms
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/screenshot_transforms.py)
   add_test(NAME hypr-agent-portal-cursor-sessions
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/cursor_sessions.py)
   add_test(

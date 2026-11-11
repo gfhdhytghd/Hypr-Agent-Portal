@@ -1,4 +1,5 @@
 #include "plugin/screenshot_capture.hpp"
+#include "plugin/screenshot_readback.hpp"
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
 
@@ -54,25 +55,6 @@ namespace {
 
 using Json = nlohmann::ordered_json;
 
-constexpr int         MAX_RGBA_READBACK_DIMENSION = 32768;
-constexpr std::size_t MAX_RGBA_READBACK_BYTES = 512ULL * 1024ULL * 1024ULL;
-constexpr std::size_t RGBA_BYTES_PER_PIXEL = 4;
-
-struct RgbaReadbackRegion {
-    int         outputCropX = 0;
-    int         outputCropTopY = 0;
-    int         outputWidth = 0;
-    int         outputHeight = 0;
-    int         srcX = 0;
-    int         srcTopY = 0;
-    int         srcWidth = 0;
-    int         srcHeight = 0;
-    int         dstX = 0;
-    int         dstY = 0;
-    std::size_t outputBytes = 0;
-    std::size_t sourceBytes = 0;
-};
-
 struct RgbaReadback {
     std::vector<unsigned char> pixels;
     int                        cropX = 0;
@@ -119,69 +101,6 @@ int clampedIntFromDouble(double value) {
     return static_cast<int>(value);
 }
 
-int clampToFramebuffer(std::int64_t value, int framebufferExtent) {
-    if (value <= 0)
-        return 0;
-    if (value >= framebufferExtent)
-        return framebufferExtent;
-    return static_cast<int>(value);
-}
-
-bool checkedRgbaByteSize(int width, int height, std::size_t& bytes) {
-    bytes = 0;
-    if (width <= 0 || height <= 0 || width > MAX_RGBA_READBACK_DIMENSION || height > MAX_RGBA_READBACK_DIMENSION)
-        return false;
-
-    const auto w = static_cast<std::size_t>(width);
-    const auto h = static_cast<std::size_t>(height);
-    if (w > std::numeric_limits<std::size_t>::max() / h)
-        return false;
-
-    const auto pixels = w * h;
-    if (pixels > std::numeric_limits<std::size_t>::max() / RGBA_BYTES_PER_PIXEL)
-        return false;
-
-    bytes = pixels * RGBA_BYTES_PER_PIXEL;
-    return bytes <= MAX_RGBA_READBACK_BYTES;
-}
-
-bool prepareRgbaReadbackRegion(int framebufferWidth,
-                               int framebufferHeight,
-                               int cropX,
-                               int cropTopY,
-                               int cropWidth,
-                               int cropHeight,
-                               RgbaReadbackRegion& region) {
-    region = {};
-    if (framebufferWidth <= 0 || framebufferHeight <= 0 || cropWidth <= 0 || cropHeight <= 0)
-        return false;
-
-    const auto cropLeft = static_cast<std::int64_t>(cropX);
-    const auto cropTop = static_cast<std::int64_t>(cropTopY);
-    const auto cropRight = cropLeft + static_cast<std::int64_t>(cropWidth);
-    const auto cropBottom = cropTop + static_cast<std::int64_t>(cropHeight);
-
-    region.srcX = clampToFramebuffer(cropLeft, framebufferWidth);
-    region.srcTopY = clampToFramebuffer(cropTop, framebufferHeight);
-    const int srcRight = clampToFramebuffer(cropRight, framebufferWidth);
-    const int srcBottom = clampToFramebuffer(cropBottom, framebufferHeight);
-    region.srcWidth = srcRight - region.srcX;
-    region.srcHeight = srcBottom - region.srcTopY;
-
-    if (!checkedRgbaByteSize(cropWidth, cropHeight, region.outputBytes))
-        return false;
-    if (region.srcWidth > 0 && region.srcHeight > 0 && !checkedRgbaByteSize(region.srcWidth, region.srcHeight, region.sourceBytes))
-        return false;
-
-    region.outputCropX = cropX;
-    region.outputCropTopY = cropTopY;
-    region.outputWidth = cropWidth;
-    region.outputHeight = cropHeight;
-    region.dstX = region.srcX - cropX;
-    region.dstY = region.srcTopY - cropTopY;
-    return true;
-}
-
 RgbaReadback readRgbaFramebufferRegion(Render::GL::CGLFramebuffer& framebuffer, int cropX, int cropTopY, int cropWidth, int cropHeight) {
     const int framebufferWidth = positiveRoundedIntFromDouble(framebuffer.m_size.x);
     const int framebufferHeight = positiveRoundedIntFromDouble(framebuffer.m_size.y);
@@ -204,8 +123,10 @@ RgbaReadback readRgbaFramebufferRegion(Render::GL::CGLFramebuffer& framebuffer, 
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFramebuffer);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer.getFBID());
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    const int readY = framebufferHeight - region.srcTopY - region.srcHeight;
-    glReadPixels(region.srcX, readY, region.srcWidth, region.srcHeight, GL_RGBA, GL_UNSIGNED_BYTE, rows.data());
+    // FULL_FAKE uses logical axes with the top at GL row zero. Preserve that
+    // orientation for both monitor artifacts and window crops; MCP maps pixels
+    // directly to logical coordinates without another output transform.
+    glReadPixels(region.srcX, region.srcTopY, region.srcWidth, region.srcHeight, GL_RGBA, GL_UNSIGNED_BYTE, rows.data());
     glBindFramebuffer(GL_READ_FRAMEBUFFER, previousReadFramebuffer);
 
     for (int y = 0; y < region.srcHeight; ++y) {
@@ -400,8 +321,9 @@ bool renderMonitorArtifact(const PHLMONITOR& monitor, const Time::steady_tp& fro
         return false;
 
     auto& ctx = g_pHyprRenderer->context();
-    width = positiveRoundedIntFromDouble(monitor->m_pixelSize.x);
-    height = positiveRoundedIntFromDouble(monitor->m_pixelSize.y);
+    // FULL_FAKE exports upright logical-axis pixels on this Hyprland branch.
+    width = positiveRoundedIntFromDouble(monitor->m_transformedSize.x);
+    height = positiveRoundedIntFromDouble(monitor->m_transformedSize.y);
     std::size_t framebufferBytes = 0;
     if (!checkedRgbaByteSize(width, height, framebufferBytes))
         return false;
@@ -451,8 +373,8 @@ bool renderWindowArtifact(const PHLWINDOW& window,
     width = positiveIntFromDouble(sourceCropBox.w);
     height = positiveIntFromDouble(sourceCropBox.h);
 
-    const int framebufferWidth = positiveRoundedIntFromDouble(monitor->m_pixelSize.x);
-    const int framebufferHeight = positiveRoundedIntFromDouble(monitor->m_pixelSize.y);
+    const int framebufferWidth = positiveRoundedIntFromDouble(monitor->m_transformedSize.x);
+    const int framebufferHeight = positiveRoundedIntFromDouble(monitor->m_transformedSize.y);
     std::size_t framebufferBytes = 0;
     std::size_t cropBytes = 0;
     if (!checkedRgbaByteSize(framebufferWidth, framebufferHeight, framebufferBytes) || !checkedRgbaByteSize(width, height, cropBytes))

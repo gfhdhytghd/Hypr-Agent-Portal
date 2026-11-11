@@ -555,7 +555,7 @@ class WorkspaceLaunchTests(unittest.TestCase):
                 def run(argv, **kwargs):
                     calls.append(argv)
                     return __import__("subprocess").CompletedProcess(argv, 0, "ok", "")
-                with mock.patch.object(module.shutil, "which", return_value="hyprctl"), mock.patch.object(module, "is_lua_config_provider", return_value=provider), mock.patch.object(module.subprocess, "run", side_effect=run):
+                with mock.patch.object(module.shutil, "which", return_value="hyprctl"), mock.patch.object(module, "hyprctl_environment", return_value={}), mock.patch.object(module, "is_lua_config_provider", return_value=provider), mock.patch.object(module.subprocess, "run", side_effect=run):
                     module.hyprctl_exec("kitty --title 'test'", workspace)
                 if provider:
                     self.assertEqual(calls, [["hyprctl", "dispatch", f'hl.dsp.exec_cmd("kitty --title \'test\'", {{ workspace = "{workspace} silent", no_focus = true }})']])

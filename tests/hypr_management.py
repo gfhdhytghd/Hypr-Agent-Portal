@@ -478,6 +478,22 @@ class HyprManagementTests(unittest.TestCase):
         self.assertEqual(state.active_workspace()["name"], "dev")
         self.assertEqual(calls, [("hyprctl", "-j", "clients"), ("hyprctl", "-j", "activeworkspace")])
 
+    def test_cli_accepts_legacy_replies_and_checks_versioned_failures(self):
+        cases = (
+            ("", ""), ("ok", ""), ("hypr-agent-portal/1 ok", ""),
+            ("hypr-agent-portal/2 ok", "invalid native dispatch reply"),
+            ("hypr-agent-portal/1 error guard-active:locked", "guard-active:locked"),
+        )
+        for output, expected_error in cases:
+            replies = [("configProvider: lua", ""), (output, "")]
+            def run(argv, **kwargs):
+                stdout, stderr = replies.pop(0)
+                return __import__("subprocess").CompletedProcess(argv, 0, stdout, stderr)
+            with mock.patch.object(portalctl, "hyprctl_environment", return_value={}), mock.patch.object(portalctl.subprocess, "run", side_effect=run):
+                result = portalctl.dispatch("hypr-agent-portal:guard", "locked")
+            self.assertEqual(result.returncode, int(bool(expected_error)))
+            self.assertIn(expected_error, result.stderr)
+
     def test_native_management_source_contract_holds_identity_across_dispatch(self) -> None:
         source = (ROOT / "src" / "plugin" / "main.cpp").read_text(encoding="utf-8")
         block = source.split("SDispatchResult dispatchManage", 1)[1].split("SDispatchResult dispatchPanic", 1)[0]
@@ -497,7 +513,7 @@ class HyprManagementTests(unittest.TestCase):
 
         def fake_run(argv, **_kwargs):
             lua_calls.append(tuple(argv))
-            stdout = "configProvider: lua\n" if "systeminfo" in argv else "ok"
+            stdout = "configProvider: lua\n" if "systeminfo" in argv else "hypr-agent-portal/1 ok"
             return __import__("subprocess").CompletedProcess(argv, 0, stdout, "")
 
         with mock.patch.object(portalctl.subprocess, "run", side_effect=fake_run):
@@ -508,13 +524,15 @@ class HyprManagementTests(unittest.TestCase):
         lua_manage_calls = [
             call
             for call in lua_calls
-            if call[:2] == ("hyprctl", "dispatch")
+            if call[:2] == ("hyprctl", "repl")
             and len(call) >= 3
-            and call[2].startswith("hl.plugin.hypr_agent_portal.manage(")
+            and "hl.plugin.hypr_agent_portal.manage(" in call[2]
         ]
         self.assertEqual(
             lua_manage_calls,
-            [("hyprctl", "dispatch", 'hl.plugin.hypr_agent_portal.manage("focus,address:0xabc@pid=101@start=1001")')],
+            [("hyprctl", "repl", portalctl.lua_dispatch_expression(
+                'hl.plugin.hypr_agent_portal.manage("focus,address:0xabc@pid=101@start=1001")'
+            ))],
         )
         self.assertEqual(
             portalctl.lua_plugin_dispatcher("hypr-agent-protal:manage", "workspace_activate,name:dev"),
@@ -566,7 +584,7 @@ class WorkspaceLaunchTests(unittest.TestCase):
         module = self.server()
         window = {"address": "launch-fixture", "class": "kitty", "workspace": {"id": 19, "name": "19"}}
         active = {"workspace": {"id": 1, "name": "1"}, "window": {"address": "human", "pid": 2}}
-        with mock.patch.object(module, "list_hypr_windows", return_value=[]), mock.patch.object(module, "wait_for_launch_window", return_value=(window, [window])), mock.patch.object(module, "resolve_hypr_window", return_value=window), mock.patch.object(module, "launch_active_state", return_value=active), mock.patch.object(module, "hyprctl_exec", return_value="ok") as execute, mock.patch.object(module, "session_action", return_value={"ok": True}) as session:
+        with mock.patch.object(module, "list_hypr_windows", return_value=[]), mock.patch.object(module, "wait_for_launch_window", return_value=(window, [window], "class")), mock.patch.object(module, "resolve_hypr_window", return_value=window), mock.patch.object(module, "launch_active_state", return_value=active), mock.patch.object(module, "hyprctl_exec", return_value="ok") as execute, mock.patch.object(module, "session_action", return_value={"ok": True}) as session:
             result = module.tool_launch_app({"command": "kitty", "workspace": 19, "reuse_existing": False})["structuredContent"]
         self.assertTrue(result["ok"])
         self.assertEqual(execute.call_args.args[1], "19")
@@ -591,12 +609,71 @@ class WorkspaceLaunchTests(unittest.TestCase):
         self.assertFalse(result["activeWorkspaceChanged"])
         self.assertFalse(result["focusMoved"])
 
+    def test_launch_matches_display_names_wrappers_and_arguments(self):
+        import os
+        import tempfile
+
+        module = self.server()
+        with tempfile.TemporaryDirectory() as data:
+            applications = Path(data) / "applications"
+            applications.mkdir()
+            (applications / "code.desktop").write_text(
+                "[Desktop Entry]\nName=Visual Studio Code\nExec=/usr/bin/code %F\nStartupWMClass=Code\n",
+                encoding="utf-8",
+            )
+            cases = (
+                ({"app": "Visual Studio Code"}, "Code", "gtk-launch", "startup-wm-class"),
+                ({"app": "gnome-calculator"}, "org.gnome.Calculator", "gnome-calculator", "executable"),
+                ({"app": "fallback-wrapper"}, "UnrelatedJavaClass", "fallback-wrapper", "new-window"),
+                ({"app": "steam", "args": ["-silent"]}, "steamwebhelper", "steam", "executable"),
+                ({"app": "flatpak run org.example.Editor"}, "FlatpakEditor", "flatpak", "executable"),
+                ({"command": "wrapper --profile test"}, "UnrelatedJavaClass", "wrapper", "process"),
+                ({"app": "code.desktop"}, "Code", "gtk-launch", "class"),
+                ({"command": "terminal -e editor", "app": "Custom Editor"}, "Terminal", "terminal", "executable"),
+            )
+            environment = {"XDG_DATA_HOME": data, "XDG_DATA_DIRS": data}
+            for args, app_class, argv0, matched_by in cases:
+                with self.subTest(args=args):
+                    window = {"address": "app-fixture", "class": app_class, "pid": 123}
+                    noise = {"address": "other", "class": "unrelated", "pid": 456}
+                    windows = [] if matched_by == "new-window" else [noise]
+                    with mock.patch.dict(os.environ, environment), mock.patch.object(
+                        module, "list_hypr_windows", side_effect=[[], [*windows, window]]
+                    ), mock.patch.object(
+                        module, "launch_process_matches",
+                        side_effect=lambda candidate, _token: matched_by == "process" and candidate is window,
+                    ), mock.patch.object(module, "resolve_hypr_window", return_value=window), mock.patch.object(
+                        module, "hyprctl_exec", return_value="ok"
+                    ) as execute, mock.patch.object(module, "session_action", return_value={"ok": True}) as session:
+                        reply = module.tool_launch_app({**args, "reuse_existing": False, "timeout": 0})
+                    result = reply["structuredContent"]
+                    self.assertFalse(reply["isError"])
+                    self.assertEqual(result["target"], "address:app-fixture")
+                    self.assertEqual(result["argv"][0], argv0)
+                    self.assertEqual(result["matchedBy"], matched_by)
+                    self.assertIn("HYPR_AGENT_PORTAL_LAUNCH_TOKEN=", execute.call_args.args[0])
+                    self.assertNotIn("HYPR_AGENT_PORTAL_LAUNCH_TOKEN=", result["command"])
+                    if matched_by == "new-window":
+                        session.assert_not_called()
+                        self.assertIsNone(module.newly_launched_window(reply))
+
     def test_launch_failed_postcheck_is_explicit(self):
         module = self.server()
         window = {"address": "launch-fixture", "class": "kitty", "workspace": {"id": 1, "name": "1"}}
         states = [{"workspace": {"id": 1}, "window": {"address": "human"}}, {"workspace": {"id": 19}, "window": {"address": "launch-fixture"}}]
-        with mock.patch.object(module, "list_hypr_windows", return_value=[]), mock.patch.object(module, "wait_for_launch_window", return_value=(window, [window])), mock.patch.object(module, "resolve_hypr_window", return_value=window), mock.patch.object(module, "launch_active_state", side_effect=states), mock.patch.object(module, "hyprctl_exec", return_value="ok"), mock.patch.object(module, "session_action", return_value={"ok": True}):
-            result = module.tool_launch_app({"command": "kitty", "workspace": 19, "reuse_existing": False})["structuredContent"]
+        with mock.patch.object(module, "list_hypr_windows", return_value=[]), mock.patch.object(module, "wait_for_launch_window", return_value=(window, [window], "class")), mock.patch.object(module, "resolve_hypr_window", return_value=window), mock.patch.object(module, "launch_active_state", side_effect=states), mock.patch.object(module, "hyprctl_exec", return_value="ok"), mock.patch.object(module, "session_action", return_value={"ok": True}):
+            launch_args = {"command": "kitty", "workspace": 19, "reuse_existing": False}
+            executed = []
+            def execute(step, _):
+                executed.append(step.action)
+                return module.tool_launch_app(dict(step.arguments))
+            sequence = module.run_action_sequence(
+                [{"action": "launch_app", "args": launch_args}, {"action": "wait"}], executor=execute
+            )
+        self.assertEqual(executed, ["launch_app"])
+        self.assertFalse(sequence["ok"])
+        self.assertEqual(sequence["steps"][0]["status"], "error")
+        result = sequence["steps"][0]["result"]["structuredContent"]
         self.assertFalse(result["ok"])
         self.assertFalse(result["workspaceVerified"])
         self.assertTrue(result["activeWorkspaceChanged"])

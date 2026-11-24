@@ -4,6 +4,7 @@ import importlib.util
 import json
 import pathlib
 import tempfile
+from unittest.mock import patch
 
 
 def load_ctl():
@@ -16,10 +17,36 @@ def load_ctl():
     return module
 
 
+def test_automatic_asset_reference(tmp: pathlib.Path) -> None:
+    # The script imports Pillow when launched. This ownership check never
+    # decodes an image and should also run in a Pillow-free unit environment.
+    source = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "install-codex-cursor-asset"
+    loader = importlib.machinery.SourceFileLoader("cursor_asset", str(source))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict("sys.modules", {"PIL": __import__("types").SimpleNamespace(Image=None)}):
+        loader.exec_module(module)
+
+    reference = tmp / "source.png"
+    reference.write_bytes(b"fixture")
+    module.DEFAULT_OPEN_CODEX_REFERENCE = reference
+    reference.chmod(0o600)
+    with module.open_default_reference() as stream:
+        assert stream.read() == b"fixture"
+    reference.chmod(0o666)
+    assert module.open_default_reference() is None
+    alias = tmp / "untrusted.png"
+    alias.symlink_to(reference)
+    reference.chmod(0o600)
+    module.DEFAULT_OPEN_CODEX_REFERENCE = alias
+    assert module.open_default_reference() is None
+
+
 def main() -> int:
     ctl = load_ctl()
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir)
+        test_automatic_asset_reference(tmp)
         artifact = tmp / "monitor.rgba"
         artifact.write_bytes(bytes([240, 240, 240, 255]) * 100)
         artifact.chmod(0o600)

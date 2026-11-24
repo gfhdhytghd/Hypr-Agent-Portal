@@ -10,6 +10,8 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from unittest.mock import patch
@@ -97,13 +99,16 @@ class CursorSessions(unittest.TestCase):
                 ]
                 for args in paths:
                     mcp.call_ctl(args)
-                for name, payload in calls:
+                submissions = [(name, payload) for name, payload in calls if not payload.startswith("status,")]
+                self.assertEqual(len(calls), len(submissions) + 1)
+                self.assertEqual(calls[3], (calls[2][0], "status," + submissions[2][1].split(",")[8]))
+                for name, payload in submissions:
                     self.assertIn("cursor_session=" + mcp.CURSOR_SESSION, payload)
                     self.assertIn("theme=minimal", payload)
                     self.assertIn("reduced_motion=1", payload)
                 self.assertTrue(calls[2][0].endswith(":pointer-relative"))
-                self.assertEqual(calls[3][0], "hypr-agent-protal:pointer-relative")
-                self.assertEqual(calls[4][1].split(",")[:4], ["address:0x1", "tap", "enter", ""])
+                self.assertEqual(submissions[3][0], "hypr-agent-protal:pointer-relative")
+                self.assertEqual(submissions[4][1].split(",")[:4], ["address:0x1", "tap", "enter", ""])
                 mcp.end_own_agent_cursor()
                 self.assertEqual(calls[-1], ("hypr-agent-portal:indicator-end", mcp.CURSOR_SESSION))
         for namespace in ("portal", "protal"):
@@ -171,9 +176,146 @@ class CursorSessions(unittest.TestCase):
         result = blocked.handle({"id": 1, "method": "tools/call", "params": {"name": "end_agent_cursor", "arguments": {}}})
         self.assertTrue(result["result"]["isError"])
 
+    def test_stdio_stops_only_matching_request_and_services_panic(self):
+        mcp = bridge(SECURITY_ENABLED="0")
+        first_start = threading.Event()
+        unrelated_checked = threading.Event()
+        panic_seen = threading.Event()
+        second_started = threading.Event()
+        eof_started = threading.Event()
+        still_running = threading.Event()
+        waits = {"first": first_start, "second": second_started, "eof": eof_started}
+
+        def wait(arguments):
+            started = waits[arguments["fixture"]]
+            started.set()
+            if started is first_start:
+                self.assertTrue(unrelated_checked.wait(2))
+                mcp.request_checkpoint()
+                still_running.set()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                mcp.request_checkpoint()
+                time.sleep(0.01)
+            self.fail("request was not cancelled")
+
+        def panic(_):
+            panic_seen.set()
+            return mcp.result_text({"ok": True})
+
+        def call(request_id, name, arguments):
+            return json.dumps({"id": request_id, "method": "tools/call",
+                               "params": {"name": name, "arguments": arguments}})
+
+        def messages():
+            yield call(1, "wait", {"fixture": "first"})
+            self.assertTrue(first_start.wait(2))
+            yield json.dumps({"method": "notifications/cancelled", "params": {"requestId": "other"}})
+            unrelated_checked.set()
+            self.assertTrue(still_running.wait(2))
+            yield json.dumps({"method": "notifications/cancelled", "params": {"requestId": 1}})
+            yield call(2, "wait", {"fixture": "second"})
+            self.assertTrue(second_started.wait(2))
+            yield json.dumps({"id": 3, "method": "tools/call", "params": {"name": "panic"}})
+            self.assertTrue(panic_seen.wait(2))
+            yield call(4, "wait", {"fixture": "eof"})
+            self.assertTrue(eof_started.wait(2))
+
+        output = io.StringIO()
+        with patch.dict(mcp.SEMANTIC_TOOLS, {"wait": wait, "panic": panic}), patch.object(
+            mcp, "ensure_session_environment"
+        ), patch.object(mcp, "collect_runtime_guards", return_value=mcp.GuardInputs()), patch.object(
+            mcp.sys, "stdin", messages()
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(mcp.stdio_main(), 0)
+        replies = {response["id"]: response["result"] for response in map(json.loads, output.getvalue().splitlines())}
+        self.assertIn("notifications/cancelled", replies[1]["content"][0]["text"])
+        self.assertIn("panic requested", replies[2]["content"][0]["text"])
+        self.assertTrue(replies[3]["structuredContent"]["ok"])
+        self.assertIn("stdio shutdown", replies[4]["content"][0]["text"])
+
+    def test_screenshot_timeout_reclaims_parent_owned_directory(self):
+        mcp = bridge()
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"XDG_RUNTIME_DIR": root}):
+            existing = pathlib.Path(root) / "other-request"
+            existing.mkdir()
+            def process(command, **kwargs):
+                output = pathlib.Path(command[command.index("--output-dir") + 1])
+                (output / "native-artifact.rgba").write_bytes(b"fixture")
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            with patch.object(mcp, "find_ctl", return_value="ctl"), patch.object(
+                mcp, "hyprctl_environment", return_value={}
+            ), patch.object(mcp, "run_request_process", side_effect=process):
+                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                    mcp.call_ctl(["screenshot", "--base64"])
+            self.assertEqual(list(pathlib.Path(root).iterdir()), [existing])
+
+    def test_motion_acknowledgement_precedes_cursor_update(self):
+        ctl = load(ROOT / "scripts" / "hypr-agent-portalctl")
+        args = ctl.build_parser().parse_args(["pointer", "addr", "1", "2", "tripleclick", "--json"])
+        for terminal_output, expected_return in (("ok", 0), ("pointer-operation-cancelled", 1)):
+            calls = []
+            def dispatch(name, payload):
+                calls.append(payload)
+                if len(calls) == 1:
+                    self.assertIn(",tripleclick,", payload)
+                    return subprocess.CompletedProcess([], 0, "ok", "")
+                self.assertEqual(payload, "status," + calls[0].rsplit(",", 1)[-1])
+                if len(calls) == 2:
+                    return subprocess.CompletedProcess([], 1, "", "pointer-operation-pending")
+                return subprocess.CompletedProcess([], expected_return, terminal_output, "")
+
+            with patch.object(ctl, "dispatch", side_effect=dispatch), patch.object(
+                ctl, "cursor_state_path", return_value=pathlib.Path("/unused")
+            ), patch.object(ctl, "write_agent_cursor") as update, patch.object(
+                ctl.time, "sleep"
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(ctl.pointer(args), expected_return)
+                self.assertEqual(update.call_count, int(expected_return == 0))
+            self.assertEqual(len(calls), 3)
+
+    def test_old_pointer_dispatcher_and_new_operation_failure(self):
+        ctl = load(ROOT / "scripts" / "hypr-agent-portalctl")
+        usage = "usage: hypr-agent-portal:pointer <window-regex>,<x>,<y>,<move|click|press|release|drag>"
+        for action, status, expected in (
+            (["drag", "left", "3", "4"], usage, 0),
+            (["doubleclick"], usage, 0),
+            (["doubleclick"], "pointer-operation-unknown", 1),
+        ):
+            args = ctl.build_parser().parse_args(["pointer", "addr", "1", "2", *action, "--json"])
+            replies = [
+                subprocess.CompletedProcess([], 0, "ok", ""),
+                subprocess.CompletedProcess([], 1, "", status),
+            ]
+            with patch.object(ctl, "dispatch", side_effect=replies) as dispatch, patch.object(
+                ctl, "cursor_state_path", return_value=pathlib.Path("/unused")
+            ), patch.object(ctl, "write_agent_cursor") as update, contextlib.redirect_stdout(
+                io.StringIO()
+            ), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(ctl.pointer(args), expected)
+                self.assertEqual(dispatch.call_count, 2)
+                self.assertEqual(update.call_count, int(expected == 0))
+
+        args = ctl.build_parser().parse_args(["pointer", "addr", "1", "2", "tripleclick", "--json"])
+        replies = [
+            subprocess.CompletedProcess([], 1, "", "unknown pointer action"),
+            subprocess.CompletedProcess([], 0, "ok", ""),
+            subprocess.CompletedProcess([], 0, "ok", ""),
+        ]
+        with patch.object(ctl, "dispatch", side_effect=replies) as dispatch, patch.object(
+            ctl, "cursor_state_path", return_value=pathlib.Path("/unused")
+        ), patch.object(ctl, "write_agent_cursor"), patch.object(
+            ctl.time, "sleep"
+        ), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ctl.pointer(args), 0)
+            self.assertIn(",doubleclick,", dispatch.call_args_list[1].args[1])
+            self.assertIn(",click,", dispatch.call_args_list[2].args[1])
+
     def test_eof_exception_and_shutdown_cleanup(self):
         for failure in (False, True):
             mcp = bridge()
+            mcp.CURSOR_TOUCHED = True
+            mcp.SESSION_CLEANUP_NEEDED = True
             calls = []
             def fake_ctl(args):
                 calls.append(args)
@@ -185,7 +327,7 @@ class CursorSessions(unittest.TestCase):
                             mcp.main()
                 else:
                     self.assertEqual(mcp.main(), 0)
-            self.assertEqual(calls, [["indicator-end", "--json"]])
+            self.assertEqual(calls, [["session", "--json", "end"], ["indicator-end", "--json"]])
             self.assertTrue(mcp.CURSOR_ENDED)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import stat
 from pathlib import Path
 
 from PIL import Image
@@ -42,10 +43,23 @@ def candidate_sources() -> list[Path]:
     return candidates
 
 
-def premultiplied_rgba_bytes(png_path: Path) -> bytes:
-    image = Image.open(png_path).convert("RGBA")
-    if image.size != (252, 252):
-        raise SystemExit(f"{png_path} is {image.size}, expected 252x252")
+def open_default_reference():
+    try:
+        fd = os.open(DEFAULT_OPEN_CODEX_REFERENCE, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        os.close(fd)
+        return None
+    return os.fdopen(fd, "rb")
+
+
+def premultiplied_rgba_bytes(png_source) -> bytes:
+    with Image.open(png_source) as png:
+        if png.size != (252, 252):
+            raise SystemExit(f"cursor PNG is {png.size}, expected 252x252")
+        image = png.convert("RGBA")
 
     output = bytearray()
     data = image.tobytes()
@@ -69,8 +83,13 @@ def main() -> int:
     args = parser.parse_args()
 
     source = args.source
+    owned_reference = None
     if source is None:
         sources = candidate_sources()
+        if sources and sources[0] == DEFAULT_OPEN_CODEX_REFERENCE:
+            owned_reference = open_default_reference()
+            if owned_reference is None:
+                sources.pop(0)
         if not sources:
             raise SystemExit("No official cursor PNG found. Pass the extracted 252x252 PNG path explicitly.")
         source = sources[0]
@@ -80,8 +99,12 @@ def main() -> int:
     raw_path = output_dir / "codex-cursor-252.abgr"
     png_copy = output_dir / "codex-cursor-252.png"
 
-    raw_path.write_bytes(premultiplied_rgba_bytes(source))
-    shutil.copyfile(source, png_copy)
+    with owned_reference if owned_reference is not None else source.open("rb") as stream:
+        raw_path.write_bytes(premultiplied_rgba_bytes(stream))
+        if not (png_copy.exists() and source.samefile(png_copy)):
+            stream.seek(0)
+            with png_copy.open("wb") as output:
+                shutil.copyfileobj(stream, output)
 
     print(f"source={source}")
     print(f"raw={raw_path}")

@@ -620,6 +620,7 @@ ScreenshotResult captureScreenshotSession(const std::filesystem::path& outputJso
 
     Json root;
     root["id"] = id;
+    root["protocolVersion"] = 1;
     root["mode"] = targetWindow ? "window" : "monitors";
     root["monitors"] = Json::array();
     root["windows"] = Json::array();

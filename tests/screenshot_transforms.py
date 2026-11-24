@@ -56,7 +56,7 @@ def main():
             artifact.chmod(0o600)
             for scale in (1.0, 1.25, 2.0):
                 geometry = {"x": -70.5, "y": 25.25, "width": width / scale, "height": height / scale}
-                session = {"monitors": [{"geometry": geometry, "scale": scale,
+                session = {"protocolVersion": 1, "monitors": [{"geometry": geometry, "scale": scale,
                     "transform": transform, "artifactPath": str(artifact),
                     "artifactWidth": width, "artifactHeight": height, "artifactTopDown": True}]}
                 png, metadata = ctl.render_session_png(session)
@@ -71,6 +71,32 @@ def main():
                         assert abs(gy - (geometry["y"] + (y + 0.5) / scale)) < 1e-9
                         assert abs(wx - (x + 0.5) / scale) < 1e-9
                         assert abs(wy - (y + 0.5) / scale) < 1e-9
+        raw = bytes(channel for row in range(7) for _ in range(20) for channel in (row, 20, 0, 255))
+        artifact.write_bytes(raw)
+        output = {
+            "name": "left", "geometry": {"x": 0, "y": 0, "width": 16, "height": 6},
+            "scale": 1.25, "artifactPath": str(artifact), "artifactWidth": 20,
+            "artifactHeight": 7, "artifactTopDown": True,
+        }
+        session = {"protocolVersion": 1, "monitors": [output]}
+        png, _ = ctl.render_session_png(session)
+        width, height, rgba = png_rgba(png)
+        assert (width, height, len(rgba)) == (20, 8, 20 * 8 * 4)
+        assert rgba[-4:] == bytes((6, 20, 0, 255))
+        legacy_output = {key: value for key, value in output.items() if key != "artifactTopDown"}
+        legacy_png, _ = ctl.render_session_png({"monitors": [legacy_output]})
+        assert legacy_png == png
+        for invalid, message in (
+            ({"monitors": [output, {"name": "right", "artifactPath": ""}]}, "right"),
+            ({"protocolVersion": 2}, "protocol version"),
+            ({"monitors": [{**output, "artifactTopDown": False}]}, "orientation"),
+        ):
+            try:
+                ctl.render_session_png({**session, **invalid})
+            except RuntimeError as exc:
+                assert message in str(exc)
+            else:
+                raise AssertionError("invalid screenshot accepted")
     print("all 8 transforms: PNG pixels and MCP click mapping passed at scales 1, 1.25, 2")
     return 0
 

@@ -828,13 +828,13 @@ def test_native_approval_dispatch_supports_lua_and_compat_namespace() -> None:
         if command[1:] == ["systeminfo"]:
             return mod.subprocess.CompletedProcess(command, 0, "configProvider: lua\n", "")
         expression = command[2]
-        assert command[:2] == ["/usr/bin/hyprctl", "dispatch"]
+        assert command[:2] == ["/usr/bin/hyprctl", "repl"]
         if '.approval("arm ' in expression or '.approval("cancel ' in expression:
-            return mod.subprocess.CompletedProcess(command, 0, "ok\n", "")
+            return mod.subprocess.CompletedProcess(command, 0, "hypr-agent-portal/1 ok\n", "")
         if "hypr_agent_portal.approval" in expression:
-            return mod.subprocess.CompletedProcess(command, 1, "lua plugin function unavailable\n", "")
+            return mod.subprocess.CompletedProcess(command, 1, "error: hypr_agent_portal is a nil value\n", "")
         assert "hypr_agent_protal.approval" in expression
-        return mod.subprocess.CompletedProcess(command, 1, "approval-pending-press-f12\n", "")
+        return mod.subprocess.CompletedProcess(command, 0, "hypr-agent-portal/1 error approval-pending-press-f12\n", "")
 
     original_binary = mod._trusted_hyprctl_binary
     original_run = mod.subprocess.run
@@ -848,12 +848,15 @@ def test_native_approval_dispatch_supports_lua_and_compat_namespace() -> None:
         mod._trusted_hyprctl_binary = original_binary
         mod.subprocess.run = original_run
 
-    dispatches = [command for command in calls if command[1] == "dispatch"]
+    dispatches = [command for command in calls if command[1] == "repl"]
     assert dispatches == [
-        ["/usr/bin/hyprctl", "dispatch", f'hl.plugin.hypr_agent_portal.approval("arm {challenge} 5000")'],
-        ["/usr/bin/hyprctl", "dispatch", f'hl.plugin.hypr_agent_portal.approval("status {challenge}")'],
-        ["/usr/bin/hyprctl", "dispatch", f'hl.plugin.hypr_agent_protal.approval("status {challenge}")'],
-        ["/usr/bin/hyprctl", "dispatch", f'hl.plugin.hypr_agent_portal.approval("cancel {challenge}")'],
+        ["/usr/bin/hyprctl", "repl", mod.lua_dispatch_expression(call)]
+        for call in (
+            f'hl.plugin.hypr_agent_portal.approval("arm {challenge} 5000")',
+            f'hl.plugin.hypr_agent_portal.approval("status {challenge}")',
+            f'hl.plugin.hypr_agent_protal.approval("status {challenge}")',
+            f'hl.plugin.hypr_agent_portal.approval("cancel {challenge}")',
+        )
     ]
 
 
@@ -1869,6 +1872,31 @@ def test_mcp_high_risk_key_forms_and_default_special_equivalence() -> None:
     assert module.action_is_high_risk("press_key", {"key": "f4", "modifiers": "alt"})
     assert module.action_is_high_risk("press_key", {"key": "w", "modifiers": "shift+ctrl"})
     assert module.action_is_high_risk("press_key", {"keycode": 30})
+    assert module.action_is_high_risk("press_key", {"key": "del"})
+    assert module.action_is_high_risk("press_key", {"key": "F04", "modifiers": "option"})
+    assert module.action_is_high_risk("press_key", {"key": "17", "modifiers": "control+ctrl"})
+    for kwargs in ({"key": "w,ctrl"}, {"key": "w", "modifiers": "ctrl,shift"}):
+        assert module.action_is_high_risk("press_key", kwargs)
+    for args, expected in (
+        ({"keys": "ctrl+shift+t"}, ("t", "ctrl+shift")),
+        ({"keys": "ctrl-c"}, ("c", "ctrl")),
+        ({"key": "Control_L"}, ("leftctrl", "")),
+        ({"keys": ","}, ("comma", "")),
+        ({"keys": "-"}, ("minus", "")),
+        ({"keys": "+"}, ("equal", "shift")),
+        ({"keys": "ctrl++"}, ("equal", "ctrl+shift")),
+    ):
+        assert module.key_from_args(args) == expected
+        assert not module.action_is_high_risk("press_key", args)
+    assert module.launch_parts({"app": "chromium", "args": ["--new-window"]})[0].count("--new-window") == 1
+    assert module.launch_parts({"app": "terminal", "args": ["-e", "echo"]})[0][1:] == ["-e", "echo"]
+    try:
+        module.launch_parts({"app": "chromium", "url": "--unexpected-option"})
+    except RuntimeError as exc:
+        assert "command-line option" in str(exc)
+    else:
+        raise AssertionError("accepted a launch option in url")
+    assert module.launch_parts({"app": "chromium", "url": "https://example.org/"})[0][-1] == "https://example.org/"
     states = [[{"name": "special:special"}], []]
     module.visible_special_workspaces = lambda: {item["name"] for item in states[0]}
 

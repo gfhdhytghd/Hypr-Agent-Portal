@@ -3,6 +3,7 @@ import importlib.util
 import math
 import os
 import pathlib
+from unittest.mock import patch
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -405,35 +406,138 @@ def main() -> int:
     assert mcp.text_is_bulk_paste_candidate("short") is False
     assert mcp.snapshot_has_grid_target({"elements": [{"controlType": "table cell"}]}) is True
 
+    monitors = [
+        {"name": "left", "x": 0, "y": 0, "width": 2560, "height": 1440, "scale": 1.25},
+        {"name": "right", "x": 2048, "y": 0, "width": 1920, "height": 1080, "scale": 1.5, "transform": 1},
+    ]
+    with patch.object(mcp, "hyprctl_json", return_value=monitors):
+        monitor = mcp.monitor_position(2100, 1120)
+        assert monitor["name"] == "right"
+        assert (monitor["x"], monitor["width"], monitor["height"]) == (52, 720, 1280)
+        assert mcp.monitor_position(2047, 1152) is None
+    assert mcp.key_from_args({"keycode": 1}) == ("code:1", "")
+    assert mcp.key_from_args({"key": "1"}) == ("1", "")
+    assert mcp.key_from_args({"key": ","}) == ("comma", "")
+
+    mcp.clear_visual_cache()
+    with patch.object(mcp.time, "time", return_value=100), patch.object(mcp, "VISUAL_CACHE_MAX_ENTRIES", 2):
+        old = mcp.cache_visual("snapshot", {}, {"capturedAt": 10, "window": {}})
+        current = mcp.cache_visual("snapshot", {}, {"capturedAt": 100, "window": {}})
+        assert old not in mcp.VISUAL_CACHE
+        assert current in mcp.VISUAL_CACHE
+        mcp.cache_visual("snapshot", {}, {})
+        mcp.cache_visual("snapshot", {}, {})
+        assert len(mcp.VISUAL_CACHE) == 2
+        assert mcp.visual_cache_entry(current, "snapshot", validate_live=False)["snapshot"]["snapshotId"] == current
+        with patch.object(mcp, "VISUAL_CACHE_MAX_BYTES", 1):
+            oversized = mcp.cache_visual("ocr", {"regions": [1]}, {})
+        assert mcp.visual_cache_entry(oversized, "ocr", validate_live=False)["payload"] == {"regions": [1]}
+        spill_directory = mcp.VISUAL_CACHE_DIRECTORY.name
+    with patch.object(mcp.time, "time", return_value=131):
+        try:
+            mcp.visual_cache_entry(current, "snapshot", validate_live=False)
+        except RuntimeError as exc:
+            assert "TTL expired" in str(exc)
+        else:
+            raise AssertionError("accepted expired visual ID")
+        assert not mcp.VISUAL_CACHE_SPILLED
+    mcp.clear_visual_cache()
+    assert not pathlib.Path(spill_directory).exists()
+
+    closed = {"id": 1, "method": "tools/call", "params":
+              {"name": "wait_for_close", "arguments": {"target": "address:0x123"}}}
+    with patch.object(mcp, "list_hypr_windows", return_value=[]), patch.object(
+        mcp, "collect_runtime_guards", return_value=mcp.GuardInputs()
+    ):
+        result = mcp.handle(closed)["result"]
+        assert result["structuredContent"]["targetClosed"] is True
+    with patch.object(mcp, "list_hypr_windows", side_effect=RuntimeError("IPC failure")):
+        result = mcp.handle(closed)["result"]
+        assert result["isError"] and "IPC failure" in result["content"][0]["text"]
+
+    snapshot = {
+        "target": "address:0x123", "window": {"at": [100, 200], "size": [40, 50]},
+        "screenshot": {"width": 80, "height": 100, "logicalBounds": {"x": 100, "y": 200, "width": 40, "height": 50}},
+    }
+    for target_key in ("app", "target"):
+        with patch.object(mcp, "current_snapshot", return_value=snapshot), patch.object(
+            mcp, "call_ctl", return_value={"ok": True}
+        ) as ctl:
+            mcp._computer({target_key: "address:0x123", "action": "press", "coordinate": [8, 10]})
+            assert ctl.call_args.args[0] == ["pointer", "--json", "--relative", "address:0x123", "4.0", "5.0", "press", "left"]
+
+    with patch.object(mcp, "current_snapshot", return_value=snapshot), patch.object(
+        mcp, "call_ctl", return_value={"ok": True}
+    ) as ctl, patch.object(mcp, "snapshot_after_action", side_effect=lambda app, previous, info: info), patch.object(
+        mcp, "mcp_snapshot_result", side_effect=lambda info: info
+    ):
+        result = mcp.semantic_click.__wrapped__({"app": "editor", "coordinate": [8, 10], "click_count": 3})
+        assert result["clickCount"] == 3
+        assert ctl.call_args.args[0][-2:] == ["tripleclick", "left"]
+        assert ctl.call_count == 1
+
+    for cursor_args, expected in (({"show_cursor": True}, "auto"), ({"show_cursor": True, "cursor_source": "agent"}, "agent")):
+        with patch.object(mcp, "require_safe_full_capture"), patch.object(
+            mcp, "call_ctl", return_value={"pngBase64": ""}
+        ) as ctl:
+            mcp._computer({"action": "screenshot", **cursor_args})
+            assert ctl.call_args.args[0][-2:] == ["--cursor-source", expected]
+
     original_list_hypr_windows = mcp.list_hypr_windows
     original_monotonic = mcp.time.monotonic
     original_sleep = mcp.time.sleep
     try:
         existing_window = {"address": "0xold", "class": "chromium", "title": "Old Chromium"}
         mcp.list_hypr_windows = lambda: [existing_window]
-        reused, reused_new = mcp.wait_for_launch_window({"address:0xold"}, "chromium", 0.0, allow_existing_fallback=True)
+        reused, reused_new, reused_match = mcp.wait_for_launch_window({"address:0xold"}, "chromium", 0.0, allow_existing_fallback=True)
         assert reused is existing_window
-        assert reused_new == []
-        strict, strict_new = mcp.wait_for_launch_window({"address:0xold"}, "chromium", 0.0, allow_existing_fallback=False)
+        assert reused_new == [] and reused_match == "existing-class"
+        strict, strict_new, strict_match = mcp.wait_for_launch_window({"address:0xold"}, "chromium", 0.0, allow_existing_fallback=False)
         assert strict is None
-        assert strict_new == []
+        assert strict_new == [] and strict_match is None
 
         unrelated_new = {"address": "0xnew", "class": "splash", "title": "Starting"}
         mcp.list_hypr_windows = lambda: [existing_window, unrelated_new]
-        selected, selected_new = mcp.wait_for_launch_window({"address:0xold"}, "chromium", 0.0, allow_existing_fallback=False)
+        selected, selected_new, match = mcp.wait_for_launch_window({"address:0xold"}, "chromium", 0.0, allow_existing_fallback=False)
         assert selected is unrelated_new
-        assert selected_new == [unrelated_new]
+        assert selected_new == [unrelated_new] and match == "new-window"
 
-        monotonic_values = iter([0.0, 0.0, 1.1])
-        mcp.time.monotonic = lambda: next(monotonic_values)
+        matching_new = {"address": "0xmatch", "class": "chromium"}
+        window_lists = iter([[existing_window, unrelated_new], [existing_window, unrelated_new, matching_new]])
+        mcp.list_hypr_windows = lambda: next(window_lists)
+        mcp.time.monotonic = lambda: 0.0
         mcp.time.sleep = lambda duration: None
-        selected, selected_new = mcp.wait_for_launch_window({"address:0xold"}, "chromium", 30.0, allow_existing_fallback=False)
-        assert selected is unrelated_new
-        assert selected_new == [unrelated_new]
+        selected, selected_new, match = mcp.wait_for_launch_window({"address:0xold"}, "chromium", 30.0)
+        assert selected is matching_new
+        assert selected_new == [unrelated_new, matching_new] and match == "class"
     finally:
         mcp.list_hypr_windows = original_list_hypr_windows
         mcp.time.monotonic = original_monotonic
         mcp.time.sleep = original_sleep
+
+    clock = [0.0]
+    with patch.object(mcp.time, "monotonic", side_effect=lambda: clock[0]), patch.object(
+        mcp.time, "sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)
+    ), patch.object(mcp, "list_hypr_windows", return_value=[unrelated_new]):
+        selected, candidates, match = mcp.wait_for_launch_window(set(), "wrapper", 8)
+        assert (selected, candidates, match) == (unrelated_new, [unrelated_new], "new-window")
+        assert clock[0] == mcp.LAUNCH_UNMATCHED_WINDOW_GRACE_SECONDS
+
+    clock[0] = 0.0
+    with patch.object(mcp.time, "monotonic", side_effect=lambda: clock[0]), patch.object(
+        mcp.time, "sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)
+    ), patch.object(mcp, "list_hypr_windows", side_effect=[[unrelated_new], [], []]):
+        selected, candidates, match = mcp.wait_for_launch_window(set(), "wrapper", 0.3)
+        assert (selected, candidates, match) == (unrelated_new, [unrelated_new], "closed-new-window")
+
+    def tool_call(arguments):
+        return mcp.handle({"method": "tools/call", "id": 1, "params": {"name": "list_apps", "arguments": arguments}})
+
+    compatible = {"unknown": "kept", "timeout": "8", "coordinate_space": "WINDOW"}
+    with patch.dict(mcp.SEMANTIC_TOOLS, {"list_apps": lambda args: mcp.mcp_text("ok", structured=args)}):
+        assert tool_call(compatible)["result"]["structuredContent"] == compatible
+        assert not tool_call(None)["result"]["isError"]
+        assert tool_call("bad shape")["error"]["code"] == -32602
 
     original_launch_parts = mcp.launch_parts
     original_list_hypr_windows = mcp.list_hypr_windows
@@ -441,16 +545,17 @@ def main() -> int:
     original_wait_for_launch_window = mcp.wait_for_launch_window
     launch_timeouts = []
     try:
-        mcp.launch_parts = lambda args: (["fake-app"], "fake-app")
+        mcp.launch_parts = lambda args, **kwargs: (["fake-app"], "fake-app")
         mcp.list_hypr_windows = lambda: []
         mcp.hyprctl_exec = lambda command: "ok"
 
-        def capture_launch_timeout(before_ids, query, timeout, *, allow_existing_fallback=True):
+        def capture_launch_timeout(before_ids, query, timeout, **kwargs):
             launch_timeouts.append(timeout)
-            return None, []
+            return None, [], None
 
         mcp.wait_for_launch_window = capture_launch_timeout
-        mcp.tool_launch_app({"app": "fake-app", "reuse_existing": False, "timeout": 30000})
+        failed = mcp.tool_launch_app({"app": "fake-app", "reuse_existing": False, "timeout": 30000})
+        assert failed["isError"] and not failed["structuredContent"]["ok"]
         assert launch_timeouts == [mcp.MAX_TOOL_WAIT_SECONDS]
     finally:
         mcp.launch_parts = original_launch_parts

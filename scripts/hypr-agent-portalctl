@@ -15,6 +15,7 @@ import time
 import zlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "mcp"))
+from native_protocol import lua_dispatch_expression, lua_quote, parse_lua_reply
 from cursor_visualization import DEFAULT_SETTINGS, metadata as cursor_metadata, state_filename, validate_session, validate_settings
 
 
@@ -444,9 +445,18 @@ def render_session_png(
     model_resolution: str = "full",
     max_dimension: int = 0,
 ) -> tuple[bytes, dict]:
-    monitors = [m for m in session.get("monitors", []) if m.get("artifactPath") and m.get("artifactWidth") and m.get("artifactHeight")]
+    version = session.get("protocolVersion")
+    if version is not None and (type(version) is not int or version != 1):
+        raise RuntimeError(f"unsupported screenshot protocol version: {version}")
+    monitors = session.get("monitors", [])
     if not monitors:
         raise RuntimeError("no rendered monitor artifacts in screenshot session")
+
+    for monitor in monitors:
+        if not monitor.get("artifactPath") or not monitor.get("artifactWidth") or not monitor.get("artifactHeight"):
+            raise RuntimeError(f"screenshot capture failed for output {monitor.get('name', '<unknown>')}")
+        if version == 1 and monitor.get("artifactTopDown") is not True:
+            raise RuntimeError("unsupported screenshot artifact orientation")
 
     min_x = min(float(m["geometry"]["x"]) for m in monitors)
     min_y = min(float(m["geometry"]["y"]) for m in monitors)
@@ -481,7 +491,7 @@ def render_session_png(
             canvas[:] = raw
             continue
 
-        if src_w == dst_w:
+        if src_w == dst_w and src_h == dst_h:
             source_stride = src_w * 4
             for y in range(dst_h):
                 out_y = dst_y + y
@@ -611,58 +621,14 @@ def hyprctl_environment() -> dict[str, str]:
     return env
 
 
-def lua_quote(value: str) -> str:
-    out = ['"']
-    for ch in value:
-        code = ord(ch)
-        if ch == "\\":
-            out.append("\\\\")
-        elif ch == '"':
-            out.append('\\"')
-        elif ch == "\n":
-            out.append("\\n")
-        elif ch == "\r":
-            out.append("\\r")
-        elif ch == "\t":
-            out.append("\\t")
-        elif 32 <= code <= 126:
-            out.append(ch)
-        else:
-            out.append(f"\\{code:03d}")
-    out.append('"')
-    return "".join(out)
-
-
 def lua_plugin_dispatcher(dispatcher: str, payload: str) -> str | None:
-    mapping = {
-        "hypr-agent-portal:pointer": ("hypr_agent_portal", "pointer"),
-        "hypr-agent-portal:pointer-relative": ("hypr_agent_portal", "pointer_relative"),
-        "hypr-agent-portal:indicator": ("hypr_agent_portal", "indicator"),
-        "hypr-agent-portal:indicator-end": ("hypr_agent_portal", "indicator_end"),
-        "hypr-agent-portal:keyboard": ("hypr_agent_portal", "keyboard"),
-        "hypr-agent-portal:screenshot": ("hypr_agent_portal", "screenshot"),
-        "hypr-agent-portal:session": ("hypr_agent_portal", "session"),
-        "hypr-agent-portal:manage": ("hypr_agent_portal", "manage"),
-        "hypr-agent-portal:panic": ("hypr_agent_portal", "panic"),
-        "hypr-agent-portal:guard": ("hypr_agent_portal", "guard"),
-        "hypr-agent-portal:approval": ("hypr_agent_portal", "approval"),
-        "hypr-agent-protal:pointer": ("hypr_agent_protal", "pointer"),
-        "hypr-agent-protal:pointer-relative": ("hypr_agent_protal", "pointer_relative"),
-        "hypr-agent-protal:indicator": ("hypr_agent_protal", "indicator"),
-        "hypr-agent-protal:indicator-end": ("hypr_agent_protal", "indicator_end"),
-        "hypr-agent-protal:keyboard": ("hypr_agent_protal", "keyboard"),
-        "hypr-agent-protal:screenshot": ("hypr_agent_protal", "screenshot"),
-        "hypr-agent-protal:session": ("hypr_agent_protal", "session"),
-        "hypr-agent-protal:manage": ("hypr_agent_protal", "manage"),
-        "hypr-agent-protal:panic": ("hypr_agent_protal", "panic"),
-        "hypr-agent-protal:guard": ("hypr_agent_protal", "guard"),
-        "hypr-agent-protal:approval": ("hypr_agent_protal", "approval"),
-    }
-    target = mapping.get(dispatcher)
-    if not target:
+    plugin, _, operation = dispatcher.partition(":")
+    namespaces = {"hypr-agent-portal": "hypr_agent_portal", "hypr-agent-protal": "hypr_agent_protal"}
+    operations = {"pointer", "pointer-relative", "indicator", "indicator-end", "keyboard",
+                  "screenshot", "session", "manage", "panic", "guard", "approval"}
+    if plugin not in namespaces or operation not in operations:
         return None
-    namespace, function = target
-    return f"hl.plugin.{namespace}.{function}({lua_quote(payload)})"
+    return f"hl.plugin.{namespaces[plugin]}.{operation.replace('-', '_')}({lua_quote(payload)})"
 
 
 def hyprland_config_provider() -> str | None:
@@ -683,7 +649,11 @@ def dispatch(dispatcher: str, payload: str = "") -> subprocess.CompletedProcess:
     if is_lua_config_provider():
         lua_dispatcher = lua_plugin_dispatcher(dispatcher, payload)
         if lua_dispatcher:
-            return subprocess.run(["hyprctl", "dispatch", lua_dispatcher], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False)
+            result = hyprctl("repl", lua_dispatch_expression(lua_dispatcher))
+            if result.returncode != 0:
+                return result
+            ok, output = parse_lua_reply(result.stdout)
+            return subprocess.CompletedProcess(result.args, 0 if ok else 1, output + "\n" if ok and output else "", "" if ok else output + "\n")
         return subprocess.CompletedProcess(
             ["hyprctl", "dispatch", dispatcher],
             1,
@@ -694,11 +664,14 @@ def dispatch(dispatcher: str, payload: str = "") -> subprocess.CompletedProcess:
     args = ["hyprctl", "dispatch", dispatcher]
     if payload:
         args.append(payload)
-    return subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False)
+    result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False, timeout=5)
+    if result.returncode == 0 and result.stdout.strip() not in ("", "ok"):
+        return subprocess.CompletedProcess(result.args, 1, "", result.stdout)
+    return result
 
 
 def hyprctl(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["hyprctl", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False)
+    return subprocess.run(["hyprctl", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False, timeout=5)
 
 
 def screenshot(args: argparse.Namespace) -> int:
@@ -726,7 +699,8 @@ def screenshot(args: argparse.Namespace) -> int:
         png, metadata = render_session_png(
             session,
             cursor_source=cursor_source,
-            cursor_path=root / state_filename(getattr(args, "cursor_session", None)),
+            cursor_path=cursor_state_path(cursor_session=getattr(args, "cursor_session", None)) if getattr(args, "request_output", False)
+            else root / state_filename(getattr(args, "cursor_session", None)),
             model_resolution=args.model_resolution,
             max_dimension=max(0, int(args.max_dimension or 0)),
         )
@@ -764,7 +738,43 @@ def pointer(args: argparse.Namespace) -> int:
     dispatcher = args.dispatcher
     if args.relative and dispatcher in {"hypr-agent-portal:pointer", "hypr-agent-protal:pointer"}:
         dispatcher += "-relative"
+    operation_id = None
+    if args.action in {"drag", "doubleclick", "double-click", "tripleclick"}:
+        operation_id = getattr(args, "operation_id", None) or secrets.token_hex(16)
+        payload += "," + operation_id
     result = dispatch(dispatcher, cursor_payload(args, payload))
+    if (args.action == "tripleclick" and result.returncode != 0
+            and (result.stderr or result.stdout).strip() == "unknown pointer action"):
+        # The old dispatcher rejects triple-click before sending any button
+        # events. Its double-click timer sends the second click after 180 ms.
+        legacy = [args.target, str(args.x), str(args.y), "doubleclick", args.button]
+        result = dispatch(dispatcher, cursor_payload(args, ",".join(legacy)))
+        if result.returncode == 0:
+            time.sleep(0.2)
+            legacy[3] = "click"
+            result = dispatch(dispatcher, cursor_payload(args, ",".join(legacy)))
+        operation_id = None
+    if result.returncode == 0 and operation_id is not None:
+        dispatched = result
+        deadline = time.monotonic() + 5.0
+        try:
+            while True:
+                result = dispatch(dispatcher, "status," + operation_id)
+                status = (result.stderr or result.stdout).strip()
+                if status.startswith("usage: hypr-agent-portal:pointer "):
+                    # Older plugins accept the extra argument but do not have
+                    # the status command. Keep the dispatch result.
+                    result = dispatched
+                    break
+                if result.returncode == 0 or status != "pointer-operation-pending":
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("native pointer operation timed out")
+                time.sleep(min(0.05, remaining))
+        except BaseException:
+            dispatch(dispatcher, "cancel," + operation_id)
+            raise
     if result.returncode != 0:
         print(result.stderr or result.stdout, file=sys.stderr, end="")
         return result.returncode or 1
@@ -797,6 +807,15 @@ def pointer(args: argparse.Namespace) -> int:
     else:
         print(result.stdout, end="")
     return 0
+
+
+def pointer_operation_cancel(args: argparse.Namespace) -> int:
+    result = dispatch("hypr-agent-portal:pointer", "cancel," + args.operation_id)
+    if result.returncode:
+        print(result.stderr or result.stdout, file=sys.stderr, end="")
+    else:
+        print(json.dumps({"ok": True}))
+    return result.returncode
 
 
 def indicator(args: argparse.Namespace) -> int:
@@ -839,7 +858,27 @@ def indicator_end(args: argparse.Namespace) -> int:
 
 
 def keyboard(args: argparse.Namespace) -> int:
-    parts = [args.target, args.action, args.key, args.modifiers or ""]
+    key = args.key
+    modifiers = args.modifiers or ""
+    if len(key) >= 2 and key.startswith('"') and key.endswith('"'):
+        key = key[1:-1]
+    if len(modifiers) >= 2 and modifiers.startswith('"') and modifiers.endswith('"'):
+        modifiers = modifiers[1:-1]
+    key = {",": "comma", "-": "minus", chr(92): "backslash",
+           "control_l": "leftctrl", "control_r": "rightctrl"}.get(key.casefold(), key)
+    if key in {"+", '"'}:
+        key = "equal" if key == "+" else "apostrophe"
+        modifiers += "+shift"
+    if re.fullmatch(r"code:[0-9]+", key):
+        # A single digit denotes a named digit key in both protocol versions.
+        key = key.removeprefix("code:").zfill(2)
+
+    def csv_field(value: str) -> str:
+        if not any(char in value for char in (",", '"', chr(92))):
+            return value
+        return '"' + value.replace(chr(92), chr(92) * 2).replace('"', chr(92) + '"') + '"'
+
+    parts = [args.target, args.action, csv_field(key), csv_field(modifiers)]
     if args.x is not None or args.y is not None:
         if args.x is None or args.y is None:
             print("--x and --y must be passed together", file=sys.stderr)
@@ -861,9 +900,11 @@ def keyboard(args: argparse.Namespace) -> int:
 
 def session(args: argparse.Namespace) -> int:
     parts = [args.action]
-    if args.target:
-        parts.append(args.target)
-
+    owner = getattr(args, "owner", None)
+    if args.target or owner:
+        parts.append(args.target or "")
+    if owner:
+        parts.append(owner)
     result = dispatch(args.dispatcher, ",".join(parts))
     if result.returncode != 0:
         print(result.stderr or result.stdout, file=sys.stderr, end="")
@@ -930,7 +971,7 @@ def guard(args: argparse.Namespace) -> int:
         result = dispatch(args.dispatcher, probe)
         output = (result.stderr or result.stdout or "").strip()
         marker = f"guard-active:{probe}"
-        if result.returncode == 0:
+        if result.returncode == 0 and output == "ok":
             state[field] = False
         elif marker in output.casefold():
             state[field] = True
@@ -1072,6 +1113,12 @@ def annotate_relation(client: dict, target: dict) -> dict:
     return annotated
 
 
+def validate_operation_id(value: str) -> str:
+    if not re.fullmatch(r"[a-f0-9]{32}", value):
+        raise argparse.ArgumentTypeError("invalid pointer operation ID")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="hypr-agent-portal command line bridge")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1079,6 +1126,7 @@ def build_parser() -> argparse.ArgumentParser:
     shot = sub.add_parser("screenshot", help="capture a compositor screenshot session")
     shot.add_argument("--dispatcher", default="hypr-agent-portal:screenshot")
     shot.add_argument("--output-dir")
+    shot.add_argument("--request-output", action="store_true", help=argparse.SUPPRESS)
     shot.add_argument("--target", help="optional Hyprland window selector for unoccluded target-window capture")
     shot.add_argument("--base64", action="store_true")
     shot.add_argument("--model-resolution", choices=["full", "logical"], default="full", help="full keeps HiDPI pixels; logical downsamples to compositor logical resolution")
@@ -1097,7 +1145,7 @@ def build_parser() -> argparse.ArgumentParser:
     ptr.add_argument("target", help="Hyprland window regex, for example address:0x1234")
     ptr.add_argument("x", type=float, help="global logical x coordinate, or window-relative x with --relative")
     ptr.add_argument("y", type=float, help="global logical y coordinate, or window-relative y with --relative")
-    ptr.add_argument("action", choices=["move", "motion", "click", "doubleclick", "double-click", "press", "down", "release", "up", "scroll", "drag"])
+    ptr.add_argument("action", choices=["move", "motion", "click", "doubleclick", "double-click", "tripleclick", "press", "down", "release", "up", "scroll", "drag"])
     ptr.add_argument("button", nargs="?", default="left", help="button name, or vertical wheel ticks for scroll")
     ptr.add_argument("x2", nargs="?", type=float, help="destination global logical x coordinate for drag, or window-relative x with --relative")
     ptr.add_argument("y2", nargs="?", type=float, help="destination global logical y coordinate for drag, or window-relative y with --relative")
@@ -1106,8 +1154,12 @@ def build_parser() -> argparse.ArgumentParser:
     ptr.add_argument("--relative", action="store_true", help="interpret x/y and drag destination as window-relative logical coordinates")
     ptr.add_argument("--dispatcher", default="hypr-agent-portal:pointer")
     ptr.add_argument("--json", action="store_true")
+    ptr.add_argument("--operation-id", type=validate_operation_id, help=argparse.SUPPRESS)
     ptr.set_defaults(func=pointer)
     add_cursor_options(ptr)
+    cancel = sub.add_parser("pointer-operation-cancel")
+    cancel.add_argument("operation_id", type=validate_operation_id)
+    cancel.set_defaults(func=pointer_operation_cancel)
 
     ind = sub.add_parser("indicator", help="show the agent cursor indicator without sending input")
     ind.add_argument("target", help="Hyprland window regex, for example address:0x1234")
@@ -1142,6 +1194,7 @@ def build_parser() -> argparse.ArgumentParser:
     sess.add_argument("target", nargs="?", help="Hyprland window regex, for example address:0x1234")
     sess.add_argument("--dispatcher", default="hypr-agent-portal:session")
     sess.add_argument("--json", action="store_true")
+    sess.add_argument("--owner", type=validate_session, help=argparse.SUPPRESS)
     sess.set_defaults(func=session)
 
     management = sub.add_parser("manage", help="invoke the identity-bound native window/workspace management gateway")

@@ -62,6 +62,7 @@ int main() {
     for(size_t i=0;i<MAX_SESSIONS;++i) assert(registry.get("s"+std::to_string(i),0));
     assert(!registry.get("overflow",0)); assert(registry.get("s0",0));
     registry.expire(30200); assert(registry.get("fresh",30200));
+    assert(feedback("tripleclick")==1);
     assert(feedback("click")==1 && feedback("type")==2 && feedback("scroll")==3 && feedback("drag")==4);
     s=Settings{};
     auto idle=raster(color("a"),s,0,8);

@@ -48,15 +48,18 @@ class ActionStep:
 
 
 class CancellationToken:
-    """Thread-safe cooperative cancellation shared with a running sequence."""
+    """Thread-safe cooperative cancellation for a tool request or sequence."""
 
     def __init__(self) -> None:
         self._event = threading.Event()
+        self._lock = threading.Lock()
         self._reason = "cancel requested"
 
     def cancel(self, reason: str = "cancel requested") -> None:
-        self._reason = str(reason or "cancel requested")
-        self._event.set()
+        with self._lock:
+            if not self._event.is_set():
+                self._reason = str(reason or "cancel requested")
+                self._event.set()
 
     @property
     def cancelled(self) -> bool:

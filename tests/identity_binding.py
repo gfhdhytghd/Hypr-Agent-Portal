@@ -218,7 +218,10 @@ def main() -> int:
     assert "auto window = resolveTargetWindow(targetRegex);" in source
     assert "auto window = resolveTargetWindow(parts[0]);" in source
     assert "const auto window = resolveTargetWindow(target);" in source
-    assert source.count("resolveTargetWindow(parts[1])") >= 3
+    assert "resolveTargetWindow(parts[1])" in source
+    session_dispatch = source.split("SDispatchResult dispatchSession", 1)[1].split("parseManageInteger", 1)[0]
+    assert "resolveTargetWindow(selector)" in session_dispatch
+    assert "session.selector == selector" in session_dispatch
     assert "captureScreenshotSession(std::filesystem::path(path), targetWindow)" in source
     assert "captureScreenshotSession(std::filesystem::path(path), parsedTarget.selector)" not in source
     screenshot_dispatch = source[source.index("SDispatchResult dispatchScreenshot("):source.index("SDispatchResult dispatchSession(")]

@@ -114,6 +114,7 @@ install(PROGRAMS
 install(FILES
   mcp/action_sequence.py
   mcp/compat_env.py
+  mcp/native_protocol.py
   mcp/cursor_visualization.py
   mcp/hypr_management.py
   mcp/hypr_socket2.py
@@ -155,6 +156,7 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
       ${CMAKE_SOURCE_DIR}/mcp/hypr-agent-protal-mcp.py
       ${CMAKE_SOURCE_DIR}/mcp/action_sequence.py
       ${CMAKE_SOURCE_DIR}/mcp/compat_env.py
+      ${CMAKE_SOURCE_DIR}/mcp/native_protocol.py
       ${CMAKE_SOURCE_DIR}/mcp/cursor_visualization.py
       ${CMAKE_SOURCE_DIR}/tests/cursor_sessions.py
       ${CMAKE_SOURCE_DIR}/mcp/hypr_management.py

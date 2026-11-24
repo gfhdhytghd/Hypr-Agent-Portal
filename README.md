@@ -38,9 +38,9 @@ plain `hyprctl dispatch` discards Lua return values. The CLI waits for timed
 drag and multi-click events to finish when the plugin reports completion.
 Older plugins retain their dispatch acknowledgement behavior.
 
-The screenshot dispatcher renders active monitor workspaces into RGBA artifacts from inside Hyprland, then writes a JSON session file. When a window selector is supplied, it renders that window directly into an offscreen framebuffer, so the artifact is not occluded by other windows. On Hyprland v0.56, the pointer dispatcher resolves targets through `Desktop::viewState()->query()`, focuses the target surface only for the injected pointer events, sends motion/button/frame events through `g_pSeatManager`, then restores the previous pointer focus. Successful background pointer actions also render a non-interactive Cua-inspired session cursor overlay with the target window's render pass, so it appears on the controlled app when that app is visible instead of being drawn as a global topmost layer.
+The screenshot dispatcher renders active monitor workspaces into RGBA artifacts from inside Hyprland, then writes a JSON session file. When a window selector is supplied, it renders that window directly into an offscreen framebuffer, so the artifact is not occluded by other windows. The pointer dispatcher resolves targets through `Desktop::viewState()->query()`, focuses the target surface only for the injected pointer events, sends motion/button/frame events through `g_pSeatManager`, then restores the previous pointer focus. Successful background pointer actions also render a non-interactive Cua-inspired session cursor overlay with the target window's render pass, so it appears on the controlled app when that app is visible instead of being drawn as a global topmost layer.
 
-For XWayland windows, the dispatcher sends to the `wlSurface()` resource and scales surface-local coordinates by `m_X11SurfaceScaledBy`. If the requested global coordinate lands on a same-process XWayland helper window, such as a search popup, pointer and keyboard dispatch are automatically routed to that related window. For native Wayland windows, it resolves subsurfaces through the root `CWLSurfaceResource::at()` traversal so they receive surface-local coordinates.
+For XWayland windows, the dispatcher sends to the `wlSurface()` resource and scales surface-local coordinates by `backend().surfaceScale()`. If the requested global coordinate lands on a same-process XWayland helper window, such as a search popup, pointer and keyboard dispatch are automatically routed to that related window. For native Wayland windows, it resolves subsurfaces through the root `CWLSurfaceResource::at()` traversal so they receive surface-local coordinates.
 
 The keyboard dispatcher sends a transactional enter/key/leave sequence directly to the target client's `CWLKeyboardResource`; it does not change `g_pSeatManager`'s global keyboard focus. If the human and agent targets belong to the same Wayland client, the previous surface, held keys, and modifier state are restored synchronously before the dispatcher returns. Native clipboard paste also sends the current selection offer directly to the target data device before Ctrl+V.
 
@@ -55,14 +55,29 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ```
 
-To build against the local Hyprland v0.56 checkout:
+The `hyprland-master` branch targets upstream Hyprland `main` at
+`df40c0bd2c7c1dfa2cfd77e91c0f561500fdcc01` (`VERSION`: `0.57.0`).
+Build and install that revision into a separate prefix. Point pkg-config and
+`PATH` at that prefix when configuring the plugin:
 
 ```sh
-PKG_CONFIG_PATH="$HOME/data/Hyprland/build${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" cmake -S . -B build-v056 -DCMAKE_BUILD_TYPE=Debug -DHYPRLAND_SOURCE_DIR="$HOME/data/Hyprland"
-cmake --build build-v056
+git clone https://github.com/hyprwm/Hyprland.git build-upstream
+git -C build-upstream checkout df40c0bd2c7c1dfa2cfd77e91c0f561500fdcc01
+git -C build-upstream submodule update --init --recursive
+cmake -S build-upstream -B build-upstream/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/build-hyprland-prefix"
+cmake --build build-upstream/build --parallel 2
+cmake --install build-upstream/build
+
+hyprland_prefix="$PWD/build-hyprland-prefix"
+PATH="$hyprland_prefix/bin:$PATH" \
+  PKG_CONFIG_PATH="$hyprland_prefix/share/pkgconfig:$hyprland_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+  cmake -S . -B build-hlmain -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-hlmain
+ctest --test-dir build-hlmain --output-on-failure
 ```
 
-Install or load `build/libhypr-agent-portal.so` as a Hyprland plugin. With hyprpm:
+Install or load `libhypr-agent-portal.so` from the chosen build directory. With hyprpm:
 
 ```sh
 hyprpm add .
@@ -513,7 +528,8 @@ scripts/hypr-agent-portalctl panic status
 ## Known Issues
 
 - The 0.4.0 visual, socket2, sequence, and window/workspace paths have headless
-  regression coverage and the native plugin is built against Hyprland 0.56.2.
+  regression coverage. CI builds the native plugin against the pinned Hyprland
+  revision listed in [Build](#build).
   They have not all been exercised in a live user session for this release;
   inspect returned verification/backend metadata and retain the documented
   polling and coordinate fallbacks where needed.

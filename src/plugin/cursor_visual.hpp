@@ -120,7 +120,7 @@ template<class T = State> struct Sessions {
     }
 };
 inline int feedback(std::string_view action) {
-    if (action == "click" || action == "doubleclick" || action == "double-click" || action == "press" || action == "down" || action == "release" || action == "up") return 1;
+    if (action == "click" || action == "doubleclick" || action == "double-click" || action == "tripleclick" || action == "press" || action == "down" || action == "release" || action == "up") return 1;
     if (action == "type" || action == "typing" || action == "key" || action == "set_value" || action == "paste") return 2;
     if (action == "scroll") return 3;
     if (action == "drag" || action == "dragging") return 4;

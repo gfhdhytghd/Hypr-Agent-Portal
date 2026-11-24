@@ -27,7 +27,10 @@ def main() -> int:
                     },
                 }
             ),
+            "[]",
             json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": []}),
+            json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "wait", "arguments": []}}),
             "",
         ]
     )
@@ -53,8 +56,12 @@ def main() -> int:
         return proc.returncode or 1
 
     lines = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
-    assert lines[0]["result"]["serverInfo"]["name"] == "hypr-agent-portal"
-    tools = lines[1]["result"]["tools"]
+    assert any(item["id"] is None and item["error"]["code"] == -32600 for item in lines)
+    replies = {item["id"]: item for item in lines if item["id"] is not None}
+    assert replies[1]["result"]["serverInfo"]["name"] == "hypr-agent-portal"
+    assert replies[3]["error"]["code"] == -32602
+    assert replies[4]["error"]["code"] == -32602
+    tools = replies[2]["result"]["tools"]
     tools_by_name = {tool["name"]: tool for tool in tools}
     expected_tools = {
         "computer",

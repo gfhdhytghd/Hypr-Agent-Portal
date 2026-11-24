@@ -2,8 +2,9 @@
 
 hypr-agent-portal is an experimental Hyprland plugin plus MCP bridge for background agent control.
 
-It exposes a set of compositor dispatchers. With the legacy hyprlang config provider
-they can be called with the normal dispatcher syntax:
+It exposes compositor dispatchers. Current supported Hyprland builds use the Lua
+config provider. The legacy examples below require an older build that still
+supports plugin dispatchers through the hyprlang config provider:
 
 ```ini
 hyprctl dispatch hypr-agent-portal:screenshot /tmp/hypr-agent-portal-session.json
@@ -31,8 +32,11 @@ hyprctl dispatch 'hl.plugin.hypr_agent_portal.panic("status")'
 hyprctl dispatch 'hl.plugin.hypr_agent_portal.approval("status 0123456789abcdef0123456789abcdef")'
 ```
 
-`scripts/hypr-agent-portalctl` detects `configProvider: lua` and emits the Lua
-dispatcher expression automatically.
+`scripts/hypr-agent-portalctl` detects `configProvider: lua` and checks the
+plugin's versioned reply. Use the CLI when you need an execution result:
+plain `hyprctl dispatch` discards Lua return values. The CLI waits for timed
+drag and multi-click events to finish when the plugin reports completion.
+Older plugins retain their dispatch acknowledgement behavior.
 
 The screenshot dispatcher renders active monitor workspaces into RGBA artifacts from inside Hyprland, then writes a JSON session file. When a window selector is supplied, it renders that window directly into an offscreen framebuffer, so the artifact is not occluded by other windows. On Hyprland v0.57.2, the pointer dispatcher resolves targets through `Desktop::viewState()->query()`, focuses the target surface only for the injected pointer events, sends motion/button/frame events through `g_pSeatManager`, then restores the previous pointer focus. Successful background pointer actions also render a non-interactive Cua-inspired session cursor overlay with the target window's render pass, so it appears on the controlled app when that app is visible instead of being drawn as a global topmost layer.
 
@@ -42,7 +46,7 @@ The keyboard dispatcher sends a transactional enter/key/leave sequence directly 
 
 XWayland applications share one X input focus, so they use a short compatibility lease instead of the fully isolated native path. Repeated agent keys extend that lease, while any real compositor keyboard event restores the previous X focus before the physical key is delivered. The MCP text path first uses AT-SPI when the target snapshot identifies a focused editable control, then falls back to the resource-level key or clipboard lanes.
 
-For apps that spawn visible helper windows or dialogs during background control, `hypr-agent-portal:session begin,<target>` records the target window workspace. New same-process related windows opened during the session are moved back to that workspace instead of appearing on the agent's current workspace. All mutating input actions begin, sync, and finish this session automatically: click (including OCR/mark clicks), hover, scroll, drag, type_text/type_into, press_key, set_value, secondary/menu actions, paste, and their low-level `computer` aliases. Nested actions share one guard; failures also finish the guard. The guard remains active while a related window is open. If an input action opens a related dialog, the MCP result and the next `get_app_state` output include the dialog's `address:0x...` target so the agent can operate that dialog before returning to the root window.
+For apps that spawn visible helper windows or dialogs during background control, `hypr-agent-portal:session begin,<target>` records the target window workspace. New windows can follow the root when they are its transients or belong to its process or a descendant process. Existing windows keep their workspaces. The plugin retires the session when its root closes, and the MCP server retires its own sessions on disconnect. All mutating input actions begin, sync, and finish this session automatically: click (including OCR/mark clicks), hover, scroll, drag, type_text/type_into, press_key, set_value, secondary/menu actions, paste, and their low-level `computer` aliases. Nested actions share one guard; failures also finish the guard. The guard remains active while a related window is open. If an input action opens a related dialog, the MCP result and the next `get_app_state` output include the dialog's `address:0x...` target so the agent can operate that dialog before returning to the root window.
 
 ## Build
 
@@ -297,7 +301,9 @@ configuration surface. Common settings are:
 - `CLIPBOARD_PERMISSIONS='write,paste_text,paste_file,paste_image'`.
   Clipboard read is intentionally absent by default. Set
   `restore_clipboard=true` on a paste and add `read` permission only when the
-  previous clipboard must be restored.
+  previous clipboard must be restored. A native `Ctrl+V` sent as a keyboard
+  shortcut delivers the current selection to the target app. Clipboard
+  capability checks apply to the dedicated clipboard tools.
 - `PRIVACY_CLASSES='org.keepassxc.KeePassXC,1password*'`. Matching windows are
   omitted from `list_apps`, cannot be targeted for observation, and block an
   untargeted full-compositor capture while visible.
@@ -370,10 +376,18 @@ scripts/hypr-agent-portalctl panic status
 scripts/hypr-agent-portalctl panic resume  # clear latch; treat as high risk
 ```
 
-`cancel` is one-shot: after cancelling the current asynchronous pointer work,
-timer, and XWayland lease, later mutations may proceed. `panic` performs the
-same cancellation and latches mutations off until a physically confirmed
-`resume` passes the high-risk confirmation flow above.
+`cancel` stops current requests and native input work without setting the latch.
+`panic` also stops native pointer, keyboard, session begin/sync, and management
+operations until `resume`. MCP `resume` requires physical confirmation only
+when the MCP security policy is enabled. The default policy is disabled.
+With that default, the latch and lock screen guard native input paths.
+AT-SPI, DBusMenu, clipboard writes, and app launch use separate paths that
+rely on the enabled MCP policy for these checks.
+
+The policy governs MCP calls. Processes with access to the Hyprland IPC socket
+can call native dispatchers directly. Confinement limits mutations. Screenshots
+and accessibility observations can include windows on other workspaces,
+subject to the configured privacy filters.
 
 For disposable integration runs, `scripts/hypr-agent-portal-sandbox doctor`
 checks nested/headless prerequisites and `run -- ...` creates isolated
@@ -458,12 +472,12 @@ Persist `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1` in the compositor environment befor
 
 The compatibility `computer` tool still exposes these lower-level actions:
 
-- `screenshot`: captures compositor screenshots and returns PNG image content plus metadata. Pass `target` for unoccluded target-window capture. Screenshot cursor drawing is a debug option and is off by default; use `show_cursor=true` or `cursor_source` values `auto`, `agent`, `hyprland`, `none` to draw it into the returned PNG.
+- `screenshot`: captures compositor screenshots and returns PNG image content plus metadata. Pass `target` for unoccluded target-window capture. Screenshot cursor drawing is a debug option and is off by default; `show_cursor=true` selects `auto` unless you specify `cursor_source`. The available sources are `auto`, `agent`, `hyprland`, and `none`. `show_cursor=false` disables the cursor regardless of source.
 - `windows`: lists Hyprland clients with addresses, classes, titles, geometry, and workspace data. Pass `related_to` to return the selected client plus same-process related windows such as dialogs or helper popups.
 - `move`, `click`, `doubleclick`, `press`, `release`: sends pointer input to a target window selector such as `address:0x1234`; screenshot/window coordinate spaces are converted relative to that target.
 - `scroll`: sends wheel axis events to a target window.
 - `drag`: presses, moves, and releases on the target window through the native pointer dispatcher; screenshot/window coordinate spaces are converted relative to that target.
-- `key`: sends a shortcut such as `ctrl+v`, `enter`, `alt+left`, or `escape` to a target window. It accepts `key`, `keys`, `modifiers`, and raw evdev `keycode` for ydotool-style fallback.
+- `key`: sends a shortcut such as `ctrl+v`, `enter`, `alt+left`, or `escape` to a target window. It accepts `key`, `keys`, `modifiers`, and raw evdev `keycode`. A digit string such as `"1"` selects the digit key, while `keycode: 1` selects Escape.
 - `type`: sends short text to the target input. Use `method` values `auto`, `keys`, `paste`, or `atspi`; by default it uses background key/paste input. Prefer `paste_text` for datasets, multiline text, CSV/TSV, or anything long.
 - `paste_text`, `paste_file`, `paste_image`: writes clipboard data and sends a background paste shortcut to the target window.
 - Text paste actions do not automatically retarget same-process popup/dialog windows; inspect the returned app state and explicitly use the popup's `address:0x...` target. They keep
@@ -630,9 +644,10 @@ scripts/install-codex-cursor-asset
 ## Rename compatibility
 
 The corrected `portal` spelling is canonical. For one release, the old
-`hypr-agent-protal:*` dispatchers, Lua namespace, config namespace, MCP/CLI
-launchers, HyprPM plugin entry, and existing `HYPR_AGENT_PROTAL_*` runtime
-variables remain compatibility aliases. New names take precedence; do not
+Lua namespace, config namespace, MCP/CLI launchers, HyprPM plugin entry, and
+`HYPR_AGENT_PROTAL_*` runtime variables retain the old spelling as a
+compatibility alias. The old `hypr-agent-protal:*` dispatcher syntax also
+requires a host that supports legacy plugin dispatchers. New names take precedence; do not
 enable both HyprPM entries. The compatibility aliases are deprecated and will
 be removed in a later release.
 

@@ -15,6 +15,22 @@ The Hyprland plugin API is version-sensitive. A report is actionable only when
 the plugin is built for the Hyprland version identified by its release tag or
 commit pin.
 
+## Runtime boundary
+
+The MCP security policy is optional and disabled by default. It gates
+physical confirmation, including MCP panic resume, when enabled. Native
+panic and lock-screen checks cover native input and window management.
+AT-SPI, DBusMenu, clipboard operations, and app launch rely on the enabled
+MCP policy for those checks.
+
+Confinement restricts mutations. Screenshot and accessibility visibility use
+the configured privacy filters. Processes with access to the Hyprland IPC
+socket can invoke the native dispatchers directly, outside MCP policy.
+
+The F12 approval check uses Hyprland's non-virtual keyboard classification.
+Access to the compositor's input devices or to a kernel input emulator
+such as uinput is outside this approval boundary.
+
 ## Reporting a vulnerability
 
 Do not open a public issue for a suspected vulnerability. Use GitHub's private

@@ -25,6 +25,8 @@ from enum import Enum, IntEnum
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 
+from native_protocol import lua_dispatch_expression, lua_quote as _lua_quote, parse_lua_reply
+
 
 class AuthorizationLevel(IntEnum):
     VIEW = 0
@@ -558,29 +560,6 @@ def _trusted_hyprctl_binary() -> pathlib.Path:
     raise RuntimeError("a root-owned, non-writable hyprctl is required for physical approval")
 
 
-def _lua_quote(value: str) -> str:
-    """Quote an ASCII approval payload as one Lua string literal."""
-    escaped: list[str] = ['"']
-    for character in value:
-        code = ord(character)
-        if character == "\\":
-            escaped.append("\\\\")
-        elif character == '"':
-            escaped.append('\\"')
-        elif character == "\n":
-            escaped.append("\\n")
-        elif character == "\r":
-            escaped.append("\\r")
-        elif character == "\t":
-            escaped.append("\\t")
-        elif 32 <= code <= 126:
-            escaped.append(character)
-        else:
-            escaped.append(f"\\{code:03d}")
-    escaped.append('"')
-    return "".join(escaped)
-
-
 def _hyprland_config_provider(binary: str) -> str:
     result = subprocess.run(
         [binary, "systeminfo"],
@@ -619,7 +598,7 @@ def _dispatch_native_approval(action: str, challenge_id: str, ttl_ms: int | None
     last_output = ""
     if provider == "lua":
         commands = [
-            [binary, "dispatch", f"hl.plugin.{namespace}.approval({_lua_quote(payload)})"]
+            [binary, "repl", lua_dispatch_expression(f"hl.plugin.{namespace}.approval({_lua_quote(payload)})")]
             for namespace in ("hypr_agent_portal", "hypr_agent_protal")
         ]
     else:
@@ -640,18 +619,18 @@ def _dispatch_native_approval(action: str, challenge_id: str, ttl_ms: int | None
         )
         output = result.stdout.strip()
         last_output = output
-        if provider != "lua" and output == "Invalid dispatcher":
-            continue
+        if provider == "lua":
+            if result.returncode != 0 and index == 0 and "hypr_agent_portal" in output and "nil value" in output:
+                continue
+            ok, output = parse_lua_reply(output, allow_empty=False) if result.returncode == 0 else (False, output)
+        else:
+            if output == "Invalid dispatcher":
+                continue
+            ok = result.returncode == 0 and output == "ok"
         if action == "status" and output == "approval-pending-press-f12":
             return False
-        if result.returncode == 0 and output == "ok":
+        if ok:
             return True
-        # Lua reports a missing plugin namespace/function as an evaluation
-        # error rather than "Invalid dispatcher".  Only that unknown response
-        # falls back to the one-release compatibility namespace; structured
-        # approval errors are authoritative and must not be retried elsewhere.
-        if provider == "lua" and index == 0 and not output.startswith("approval-"):
-            continue
         raise RuntimeError(f"native physical approval {action} failed: {output or 'no response'}")
     raise RuntimeError(f"physical approval dispatcher is unavailable: {last_output or 'no response'}")
 
@@ -663,6 +642,7 @@ def approve_confirmation(
     wall_clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
     poll_interval: float = 0.1,
+    before_arm: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Approve a challenge only after native code observes a physical F12."""
     path = pathlib.Path(confirmation_dir) if confirmation_dir is not None else default_confirmation_directory()
@@ -679,6 +659,8 @@ def approve_confirmation(
             os.unlink(pending, dir_fd=directory_fd)
             raise RuntimeError("confirmation challenge has expired")
         remaining_ms = min(120000, max(1000, int((float(challenge["expiresAt"]) - wall_clock()) * 1000)))
+        if before_arm is not None:
+            before_arm(challenge)
         if not _dispatch_native_approval("arm", challenge_id, remaining_ms):
             raise RuntimeError("native physical approval could not be armed")
         armed = True
@@ -1384,9 +1366,23 @@ def _approval_cli(arguments: list[str]) -> int:
         return 2
     challenge_id = arguments[1]
     directory = arguments[3] if len(arguments) == 4 else None
-    print(f"Physical approval requested for challenge {challenge_id}; press F12 on a real keyboard.")
+
+    def show_request(request: Mapping[str, Any]) -> None:
+        context = request.get("context") or {}
+        safe_keys = ("target", "mode", "key", "keys", "modifiers", "window_action", "workspace", "action")
+        # Escape control characters and do not print command lines, clipboard
+        # text, secrets, or arbitrary parameter values to the terminal.
+        summary = {
+            "action": request.get("action"),
+            "target": request.get("target"),
+            "parameters": {key: repr(context[key])[:160] for key in safe_keys if key in context},
+            "otherParameters": sorted(set(context) - set(safe_keys)),
+        }
+        print(json.dumps(summary, ensure_ascii=True), flush=True)
+        print(f"Physical approval requested for challenge {challenge_id}; press F12 on a real keyboard.", flush=True)
+
     try:
-        challenge = approve_confirmation(challenge_id, confirmation_dir=directory)
+        challenge = approve_confirmation(challenge_id, confirmation_dir=directory, before_arm=show_request)
     except KeyboardInterrupt:
         print("approval cancelled", file=sys.stderr)
         return 130

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import copy
+import configparser
 import contextvars
 import functools
 import hashlib
@@ -9,6 +10,7 @@ import math
 import mimetypes
 import os
 import pathlib
+import queue
 import re
 import secrets
 import signal
@@ -29,6 +31,7 @@ if str(MCP_MODULE_DIR) not in sys.path:
 
 from cursor_visualization import new_session_id, settings_from_env, settings_schema, state_filename, validate_settings
 from compat_env import promote_legacy_environment
+from native_protocol import lua_quote
 from security_audit import AuditJournal, ReplayPolicy, preflight_replay
 from security_doctor import security_readiness_diagnostics
 from process_lease import LeaseConflict, ProcessLeaseError, ProcessMutationLease
@@ -66,10 +69,15 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SERVER_VERSION = "0.4.0"
 SNAPSHOTS: dict[str, dict[str, Any]] = {}
 VISUAL_CACHE: dict[str, dict[str, Any]] = {}
+VISUAL_CACHE_SPILLED: dict[str, tuple[float, pathlib.Path]] = {}
+VISUAL_CACHE_DIRECTORY: tempfile.TemporaryDirectory | None = None
 VISUAL_CACHE_TTL_SECONDS = 30.0
+VISUAL_CACHE_MAX_ENTRIES = 32
+VISUAL_CACHE_MAX_BYTES = 128 * 1024 * 1024
+VISUAL_CACHE_LOCK = threading.Lock()
 ACTIVE_SEQUENCE_CANCELLATION: CancellationToken | None = None
-PENDING_SEQUENCE_CANCEL = False
-SEQUENCE_WORKER_PENDING = False
+REQUEST_CANCELLATION: contextvars.ContextVar[CancellationToken | None] = contextvars.ContextVar("request_cancellation", default=None)
+REQUEST_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar("request_deadline", default=None)
 SEQUENCE_STATE_LOCK = threading.Lock()
 HYPR_MANAGEMENT = HyprManagement()
 GLOBAL_MENU_LIMIT = 80
@@ -83,8 +91,10 @@ SECURITY_POLICY: SecurityPolicy = policy_from_env()
 # Random process-private visualization identity; never derived from caller args,
 # security owner, or a caller/host supplied session id.
 CURSOR_SESSION = new_session_id()
+SESSION_CLEANUP_NEEDED = False
 CURSOR_SETTINGS = settings_from_env(os.environ)
 CURSOR_ENDED = False
+CURSOR_TOUCHED = False
 CURSOR_STATE_LOCK = threading.RLock()
 
 
@@ -949,8 +959,55 @@ def error(req_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
+def request_checkpoint() -> None:
+    token = REQUEST_CANCELLATION.get()
+    if token is not None and token.cancelled:
+        raise RuntimeError(token.reason)
+    deadline = REQUEST_DEADLINE.get()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RuntimeError("tool request deadline exceeded")
+
+
+def run_request_process(command: list[str], *, timeout: float, check: bool = False, input: Any = None, **options: Any) -> Any:
+    token = REQUEST_CANCELLATION.get()
+    if token is None:
+        kwargs = {} if input is None else {"input": input}
+        return subprocess.run(command, timeout=timeout, check=check, **kwargs, **options)
+    request_checkpoint()
+    deadline = min(time.monotonic() + timeout, REQUEST_DEADLINE.get() or float("inf"))
+    if input is not None:
+        options["stdin"] = subprocess.PIPE
+    # Kill the CLI and any child hyprctl together if the request goes away.
+    # Clipboard publishers spawn their own background owners, so leave their
+    # process group alone on successful completion.
+    with subprocess.Popen(command, start_new_session=True, **options) as child:
+        try:
+            while True:
+                request_checkpoint()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    stdout, stderr = child.communicate(input=input, timeout=min(remaining, 0.1))
+                    break
+                except subprocess.TimeoutExpired:
+                    input = None
+        except BaseException:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.communicate()
+            raise
+    result = subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
+    if check:
+        result.check_returncode()
+    return result
+
+
 def call_ctl(args: list[str]) -> dict[str, Any]:
-    global CURSOR_ENDED
+    global CURSOR_ENDED, CURSOR_TOUCHED, SESSION_CLEANUP_NEEDED
+    request_checkpoint()
     args = list(args)
     if args and args[0] in {"pointer", "keyboard", "indicator", "screenshot", "indicator-end"}:
         if "--cursor-session" in args or any(arg.startswith("--cursor-session=") for arg in args):
@@ -962,23 +1019,69 @@ def call_ctl(args: list[str]) -> dict[str, Any]:
                     args.extend(["--cursor-" + key.replace("_", "-"), str(int(value)) if isinstance(value, bool) else str(value)])
                 # A failed/uncertain transport might still have shown the cursor.
                 CURSOR_ENDED = False
+                CURSOR_TOUCHED = True
+    if args and args[0] == "session":
+        args.extend(["--owner", CURSOR_SESSION])
+        SESSION_CLEANUP_NEEDED = True
+    if args and args[0] in {"keyboard", "pointer"}:
+        SESSION_CLEANUP_NEEDED = True
+    operation_id = None
+    if args and args[0] == "pointer" and any(action in args[1:] for action in ("drag", "doubleclick", "double-click", "tripleclick")):
+        operation_id = secrets.token_hex(16)
+        args.extend(["--operation-id", operation_id])
+
+    timeout = 5.0 if args and args[0] in {"panic", "session"} else MAX_TOOL_WAIT_SECONDS
+
+    def invoke() -> dict[str, Any]:
+        try:
+            proc = run_request_process(
+                [str(find_ctl()), *args],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=hyprctl_environment(),
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"hypr-agent-portalctl timed out after {timeout:g}s") from exc
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or f"hypr-agent-portalctl exited {proc.returncode}").strip())
+        if not proc.stdout.strip():
+            raise RuntimeError("hypr-agent-portalctl returned an empty response")
+        data = json.loads(proc.stdout)
+        if not isinstance(data, dict):
+            raise RuntimeError("hypr-agent-portalctl returned an invalid response")
+        return data
+
+    if args and args[0] == "screenshot":
+        # Keep a parent-owned directory even when the CLI dies before it can
+        # report the native artifact paths. Cursor state lives outside it.
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        with tempfile.TemporaryDirectory(prefix="hypr-agent-portal-capture-", dir=runtime or None) as output:
+            args.extend(["--output-dir", output, "--request-output"])
+            return invoke()
     try:
-        proc = subprocess.run(
-            [str(find_ctl()), *args],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=hyprctl_environment(),
-            check=False,
-            timeout=MAX_TOOL_WAIT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"hypr-agent-portalctl timed out after {MAX_TOOL_WAIT_SECONDS:g}s") from exc
-    if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or proc.stdout or f"hypr-agent-portalctl exited {proc.returncode}").strip())
-    if not proc.stdout.strip():
-        return {}
-    return json.loads(proc.stdout)
+        return invoke()
+    except Exception:
+        cleanup_args = None
+        if operation_id is not None:
+            cleanup_args = ["pointer-operation-cancel", operation_id]
+        elif args and args[0] == "pointer" and any(action in args[1:] for action in ("press", "release", "down", "up")):
+            cleanup_args = ["session", "end", "--owner", CURSOR_SESSION]
+        if cleanup_args is not None:
+            context = REQUEST_CANCELLATION.set(None)
+            try:
+                subprocess.run(
+                    [str(find_ctl()), *cleanup_args],
+                    env=hyprctl_environment(), stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=2, check=False,
+                )
+            except Exception:
+                # Keep the original failure if native cleanup is unavailable.
+                pass
+            finally:
+                REQUEST_CANCELLATION.reset(context)
+        raise
 
 
 def cleanup_screenshot_provenance(provenance: Any) -> None:
@@ -1079,7 +1182,7 @@ def run_available(command: str, args: list[str], *, input_bytes: bytes | None = 
     else:
         run_kwargs = {"input": input_bytes}
     try:
-        proc = subprocess.run(
+        proc = run_request_process(
             [executable, *args],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1121,7 +1224,7 @@ def busctl_user(args: list[str], *, timeout: float = 2.0) -> tuple[bool, str]:
     if not executable:
         return False, ""
     try:
-        proc = subprocess.run(
+        proc = run_request_process(
             [executable, "--user", *args],
             text=True,
             stdout=subprocess.PIPE,
@@ -1145,7 +1248,7 @@ def hyprctl_environment() -> dict[str, str]:
     hyprctl = shutil.which("hyprctl", path=env.get("PATH"))
     proc = None
     if hyprctl:
-        proc = subprocess.run([hyprctl, "instances", "-j"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, check=False)
+        proc = run_request_process([hyprctl, "instances", "-j"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, check=False, timeout=5)
     if proc is not None and proc.returncode == 0 and proc.stdout.strip():
         try:
             instances = json.loads(proc.stdout)
@@ -1168,33 +1271,11 @@ def hyprctl_environment() -> dict[str, str]:
     return env
 
 
-def lua_quote(value: str) -> str:
-    out = ['"']
-    for ch in value:
-        code = ord(ch)
-        if ch == "\\":
-            out.append("\\\\")
-        elif ch == '"':
-            out.append('\\"')
-        elif ch == "\n":
-            out.append("\\n")
-        elif ch == "\r":
-            out.append("\\r")
-        elif ch == "\t":
-            out.append("\\t")
-        elif 32 <= code <= 126:
-            out.append(ch)
-        else:
-            out.append(f"\\{code:03d}")
-    out.append('"')
-    return "".join(out)
-
-
 def hyprland_config_provider() -> str | None:
     hyprctl = shutil.which("hyprctl")
     if not hyprctl:
         return None
-    proc = subprocess.run([hyprctl, "systeminfo"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False)
+    proc = run_request_process([hyprctl, "systeminfo"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=hyprctl_environment(), check=False, timeout=5)
     if proc.returncode != 0:
         return None
     match = re.search(r"^configProvider:\s*(\S+)", proc.stdout, re.MULTILINE)
@@ -1546,7 +1627,9 @@ def window_origin(snapshot: dict[str, Any]) -> tuple[float, float]:
 
 
 def list_hypr_windows() -> list[dict[str, Any]]:
-    windows = call_ctl(["windows"]).get("windows", [])
+    windows = call_ctl(["windows"]).get("windows")
+    if not isinstance(windows, list):
+        raise RuntimeError("hypr-agent-portalctl returned an invalid window list")
     return [window for window in windows if isinstance(window, dict) and window.get("mapped", True) and not window.get("hidden", False)]
 
 
@@ -1597,7 +1680,10 @@ def resolve_hypr_window(app: str) -> dict[str, Any]:
         area = geom["width"] * geom["height"]
         return primary, focus_score, -area
 
-    matches = [window for window in windows if score(window)[0] < 100]
+    if parsed_target.qualified or query.startswith("address:"):
+        matches = [window for window in windows if address_matches(window)]
+    else:
+        matches = [window for window in windows if score(window)[0] < 100]
     if not matches:
         raise RuntimeError(f'appNotFound("{app}")')
     return sorted(matches, key=score)[0]
@@ -1640,7 +1726,43 @@ def resolve_launch_executable(name: str) -> str:
     return name
 
 
-def launch_parts(args: dict[str, Any]) -> tuple[list[str], str]:
+def launch_desktop_entry(app: str) -> tuple[str, dict[str, str]] | None:
+    data_home = os.environ.get("XDG_DATA_HOME") or str(pathlib.Path.home() / ".local/share")
+    data_dirs = (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    desktop_id = normalize_desktop_id(app)
+    # Bare executable names retain their original dispatch path. Look up a
+    # display name only when it could identify a desktop application.
+    find_display_name = " " in app and not app.endswith(".desktop")
+    if not app or "/" in app:
+        return None
+    seen = set()
+    for data_dir in (data_home, *filter(None, data_dirs)):
+        root = pathlib.Path(data_dir) / "applications"
+        paths = root.rglob("*.desktop") if find_display_name or "-" in desktop_id else [root / (desktop_id + ".desktop")]
+        for path in paths:
+            candidate_id = normalize_desktop_id(str(path.relative_to(root)).replace("/", "-"))
+            if not find_display_name and candidate_id != desktop_id:
+                continue
+            if candidate_id in seen:
+                continue
+            entry = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                with path.open(encoding="utf-8") as stream:
+                    entry.read_file(stream)
+            except (OSError, UnicodeError, configparser.Error):
+                continue
+            seen.add(candidate_id)
+            if not entry.has_section("Desktop Entry"):
+                continue
+            fields = dict(entry["Desktop Entry"])
+            if fields.get("hidden", "").lower() == "true":
+                continue
+            if not find_display_name or normalize(fields.get("name")) == normalize(app):
+                return candidate_id, fields
+    return None
+
+
+def launch_parts(args: dict[str, Any], *, desktop_id: str = "") -> tuple[list[str], str]:
     command = args.get("command")
     app = args.get("app")
     if isinstance(command, str) and command.strip():
@@ -1648,11 +1770,11 @@ def launch_parts(args: dict[str, Any]) -> tuple[list[str], str]:
             parts = shlex.split(command)
         except ValueError as exc:
             raise RuntimeError(f"invalid launch command: {exc}") from exc
-        match_query = executable_basename(parts[0]) if parts else command
+        match_query = app.strip() if isinstance(app, str) and app.strip() else (executable_basename(parts[0]) if parts else command)
     elif isinstance(app, str) and app.strip():
         app_value = app.strip()
-        if app_value.endswith(".desktop"):
-            parts = ["gtk-launch", normalize_desktop_id(app_value)]
+        if app_value.endswith(".desktop") or (desktop_id and " " in app_value):
+            parts = ["gtk-launch", desktop_id or normalize_desktop_id(app_value)]
             match_query = normalize_desktop_id(app_value)
         else:
             try:
@@ -1673,6 +1795,8 @@ def launch_parts(args: dict[str, Any]) -> tuple[list[str], str]:
         parts.extend(str(item) for item in extra_args if isinstance(item, str))
 
     url = args.get("url")
+    if isinstance(url, str) and url.startswith("-"):
+        raise RuntimeError("launch_app url must not start with a command-line option")
     new_window = args.get("new_window")
     if not isinstance(new_window, bool):
         new_window = True
@@ -1702,8 +1826,10 @@ def launch_is_chromium_like(parts: list[str]) -> bool:
     return any(token in base for token in ("chrom", "brave", "electron", "discord", "slack"))
 
 
-def launch_command_string(parts: list[str]) -> str:
+def launch_command_string(parts: list[str], *, process_token: str = "") -> str:
     env_parts = ["env", *[f"{key}={value}" for key, value in A11Y_LAUNCH_ENV.items()]]
+    if process_token:
+        env_parts.append(f"HYPR_AGENT_PORTAL_LAUNCH_TOKEN={process_token}")
     return shlex.join([*env_parts, *parts])
 
 
@@ -1719,7 +1845,7 @@ def hyprctl_exec(command: str, workspace: str | None = None) -> str:
         ruled_command = f"[workspace {workspace} silent; no_focus 1] {command}" if workspace is not None else command
         dispatch_args = [hyprctl, "dispatch", "exec", ruled_command]
     try:
-        proc = subprocess.run(
+        proc = run_request_process(
             dispatch_args,
             text=True,
             stdout=subprocess.PIPE,
@@ -1746,53 +1872,106 @@ def window_identities(windows: list[dict[str, Any]]) -> set[str]:
 
 
 def window_matches_launch(window: dict[str, Any], query: str) -> bool:
-    normalized = normalize(query)
-    if not normalized:
+    expected = normalize_desktop_id(normalize(query))
+    if not expected:
         return False
-    fields = [
-        normalize(window.get("class")),
-        normalize(window.get("initialClass")),
-        normalize(window.get("title")),
-        normalize(window.get("initialTitle")),
-        str(window.get("pid") or ""),
-    ]
-    desktop = normalized.removesuffix(".desktop")
-    return any(normalized == field or desktop == field or normalized in field or desktop in field for field in fields if field)
+    # Window titles belong to documents and web pages and are not application
+    # identities. Desktop IDs can qualify the binary name (org.foo.Editor).
+    expected = expected.removesuffix("-stable").removesuffix("-browser")
+    app_ids = [normalize(window.get(field)) for field in ("class", "initialClass")]
+    return any(
+        expected == candidate or (
+            "." not in expected and candidate.rsplit(".", 1)[-1] == expected
+        )
+        for app_id in app_ids
+        if (candidate := app_id.removesuffix("-stable").removesuffix("-browser"))
+    )
 
 
-def wait_for_launch_window(before_ids: set[str], query: str, timeout: float, *, allow_existing_fallback: bool = True) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    effective_timeout = bounded_timeout_seconds(timeout, 8.0)
-    deadline = time.monotonic() + effective_timeout
-    latest: list[dict[str, Any]] = []
-    last_new_windows: list[dict[str, Any]] = []
-    first_unmatched_window_at: float | None = None
-    while True:
-        latest = list_hypr_windows()
-        new_windows = [window for window in latest if not (window_identities([window]) & before_ids)]
-        if new_windows:
-            last_new_windows = new_windows
-        matching_new = [window for window in new_windows if window_matches_launch(window, query)]
-        if matching_new:
-            return matching_new[0], matching_new
-        if allow_existing_fallback:
-            matching_existing = [window for window in latest if window_matches_launch(window, query)]
-            if matching_existing:
-                return matching_existing[0], []
-        now = time.monotonic()
-        if new_windows and first_unmatched_window_at is None:
-            first_unmatched_window_at = now
-        if last_new_windows and first_unmatched_window_at is not None and now - first_unmatched_window_at >= min(
-            LAUNCH_UNMATCHED_WINDOW_GRACE_SECONDS, effective_timeout
+def launch_process_matches(window: dict[str, Any], process_token: str) -> bool:
+    # The compositor's exec dispatcher acknowledges the spawn without
+    # returning a PID. A launch-specific environment entry follows the
+    # executable and its descendants, including a child that outlives a wrapper.
+    marker = f"HYPR_AGENT_PORTAL_LAUNCH_TOKEN={process_token}".encode()
+    try:
+        pid = int(window.get("pid") or 0)
+        for _ in range(32):
+            if pid <= 1:
+                break
+            proc = pathlib.Path(f"/proc/{pid}")
+            try:
+                if marker in (proc / "environ").read_bytes().split(b"\0"):
+                    return True
+            except OSError:
+                pass
+            pid = int((proc / "stat").read_text().rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, TypeError, ValueError):
+        pass
+    return False
+
+
+def launch_window_match(window: dict[str, Any], query: str, *,
+                        process_token: str = "", startup_class: str = "", executable: str = "") -> str | None:
+    if window_matches_launch(window, query):
+        return "class"
+    if process_token and launch_process_matches(window, process_token):
+        return "process"
+    if startup_class and normalize(startup_class) in {normalize(window.get(key)) for key in ("class", "initialClass")}:
+        return "startup-wm-class"
+    if executable:
+        classes = [normalize(window.get(key)) for key in ("class", "initialClass")]
+        qualified_executable = re.sub(r"[-_]", ".", executable)
+        if window_matches_launch(window, executable) or any(
+            re.sub(r"[-_]", ".", candidate).endswith("." + qualified_executable)
+            or (len(executable) >= 3 and executable in candidate.rsplit(".", 1)[-1])
+            for candidate in classes
         ):
-            return last_new_windows[0], last_new_windows
+            return "executable"
+    return None
+
+
+def wait_for_launch_window(
+    before_ids: set[str], query: str, timeout: float, *, allow_existing_fallback: bool = True,
+    process_token: str = "", startup_class: str = "", executable: str = "",
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None]:
+    deadline = time.monotonic() + bounded_timeout_seconds(timeout, 8.0)
+    fallback_at = deadline
+    priority = {"class": 0, "process": 1, "startup-wm-class": 2, "executable": 3, None: 4}
+    observed = []
+    while True:
+        active_sequence_checkpoint()
+        existing = []
+        new = []
+        for window in list_hypr_windows():
+            if window_identities([window]) & before_ids:
+                if allow_existing_fallback:
+                    match = launch_window_match(window, query, startup_class=startup_class, executable=executable)
+                    if match:
+                        existing.append((match, window))
+                continue
+            match = launch_window_match(window, query, process_token=process_token,
+                                        startup_class=startup_class, executable=executable)
+            new.append((match, window))
+        now = time.monotonic()
+        if new:
+            observed = new
+            fallback_at = min(fallback_at, now + LAUNCH_UNMATCHED_WINDOW_GRACE_SECONDS)
+            match, window = min(new, key=lambda item: priority[item[0]])
+            if match == "class" or now >= fallback_at:
+                return window, [candidate for _, candidate in new], match or "new-window"
         if now >= deadline:
-            if last_new_windows:
-                return last_new_windows[0], last_new_windows
-            return None, []
-        time.sleep(0.2)
+            if existing:
+                match, window = min(existing, key=lambda item: priority[item[0]])
+                return window, [], "existing-" + match
+            if observed:
+                _, window = min(observed, key=lambda item: priority[item[0]])
+                return window, [candidate for _, candidate in observed], "closed-new-window"
+            return None, [], None
+        time.sleep(min(0.2, (fallback_at if new else deadline) - now))
 
 
 def remember_snapshot(query: str, snapshot: dict[str, Any]) -> None:
+    request_checkpoint()
     window = snapshot.get("window") or {}
     app = snapshot.get("app") or {}
     keys = [
@@ -1822,11 +2001,49 @@ def process_start_time(pid: Any) -> str:
         return ""
 
 
+def clear_visual_cache() -> None:
+    global VISUAL_CACHE_DIRECTORY
+    with VISUAL_CACHE_LOCK:
+        VISUAL_CACHE.clear()
+        VISUAL_CACHE_SPILLED.clear()
+        if VISUAL_CACHE_DIRECTORY is not None:
+            VISUAL_CACHE_DIRECTORY.cleanup()
+            VISUAL_CACHE_DIRECTORY = None
+
+
+def prune_visual_cache(now: float, *, except_token: str = "") -> None:
+    for key, old in list(VISUAL_CACHE.items()):
+        if key != except_token and not 0 <= now - old["capturedAt"] <= VISUAL_CACHE_TTL_SECONDS:
+            del VISUAL_CACHE[key]
+    for key, (captured_at, path) in list(VISUAL_CACHE_SPILLED.items()):
+        if key != except_token and not 0 <= now - captured_at <= VISUAL_CACHE_TTL_SECONDS:
+            path.unlink(missing_ok=True)
+            del VISUAL_CACHE_SPILLED[key]
+
+
+def spill_visual_cache_entry(key: str, entry: dict[str, Any]) -> None:
+    global VISUAL_CACHE_DIRECTORY
+    if VISUAL_CACHE_DIRECTORY is None:
+        VISUAL_CACHE_DIRECTORY = tempfile.TemporaryDirectory(prefix="hypr-agent-portal-visual-")
+    path = pathlib.Path(VISUAL_CACHE_DIRECTORY.name, key)
+    try:
+        with path.open("w", encoding="utf-8") as stream:
+            json.dump(entry, stream, ensure_ascii=True, separators=(",", ":"))
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    VISUAL_CACHE_SPILLED[key] = (entry["capturedAt"], path)
+
+
 def cache_visual(kind: str, payload: dict[str, Any], snapshot: dict[str, Any]) -> str:
     token = f"{kind}_{secrets.token_urlsafe(18)}"
     window = snapshot.get("window") or {}
     screenshot = snapshot.get("screenshot") or {}
-    VISUAL_CACHE[token] = {
+    if kind == "snapshot":
+        snapshot["snapshotId"] = token
+        if screenshot:
+            screenshot["id"] = token
+    entry = {
         "kind": kind,
         "payload": payload,
         "snapshot": snapshot,
@@ -1838,19 +2055,62 @@ def cache_visual(kind: str, payload: dict[str, Any], snapshot: dict[str, Any]) -
         "windowBounds": dict(snapshot.get("windowBounds") or {}),
         "sourceSize": {"width": screenshot.get("width"), "height": screenshot.get("height")},
     }
+    objects = [entry]
+    seen = set()
+    entry_size = 0
+    while objects:
+        value = objects.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        entry_size += sys.getsizeof(value)
+        if isinstance(value, dict):
+            objects.extend(value.keys())
+            objects.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            objects.extend(value)
+    request_checkpoint()
+    entry["cacheBytes"] = entry_size
+    with VISUAL_CACHE_LOCK:
+        now = time.time()
+        prune_visual_cache(now)
+        if 0 <= now - entry["capturedAt"] <= VISUAL_CACHE_TTL_SECONDS:
+            if entry_size > VISUAL_CACHE_MAX_BYTES:
+                spill_visual_cache_entry(token, entry)
+            else:
+                total_bytes = sum(item["cacheBytes"] for item in VISUAL_CACHE.values())
+                while len(VISUAL_CACHE) >= VISUAL_CACHE_MAX_ENTRIES or total_bytes + entry_size > VISUAL_CACHE_MAX_BYTES:
+                    key = next(iter(VISUAL_CACHE))
+                    old = VISUAL_CACHE[key]
+                    spill_visual_cache_entry(key, old)
+                    total_bytes -= old["cacheBytes"]
+                    del VISUAL_CACHE[key]
+                VISUAL_CACHE[token] = entry
     return token
 
 
 def visual_cache_entry(token: Any, expected_kind: str, *, validate_live: bool = True) -> dict[str, Any]:
     if not isinstance(token, str) or not token:
         raise RuntimeError(f"{expected_kind}_id is required")
-    entry = VISUAL_CACHE.get(token)
-    if not isinstance(entry, dict) or entry.get("kind") != expected_kind:
-        raise RuntimeError(f"visual cache miss for {expected_kind}_id")
-    age = time.time() - float(entry.get("capturedAt") or 0.0)
-    if age < 0 or age > VISUAL_CACHE_TTL_SECONDS:
-        VISUAL_CACHE.pop(token, None)
-        raise RuntimeError(f"stale visual target: {expected_kind} cache TTL expired")
+    with VISUAL_CACHE_LOCK:
+        now = time.time()
+        prune_visual_cache(now, except_token=token)
+        if token in VISUAL_CACHE_SPILLED:
+            captured_at, path = VISUAL_CACHE_SPILLED[token]
+            if not 0 <= now - captured_at <= VISUAL_CACHE_TTL_SECONDS:
+                path.unlink(missing_ok=True)
+                del VISUAL_CACHE_SPILLED[token]
+                raise RuntimeError(f"stale visual target: {expected_kind} cache TTL expired")
+            with path.open(encoding="utf-8") as stream:
+                entry = json.load(stream)
+        else:
+            entry = VISUAL_CACHE.get(token)
+        if not isinstance(entry, dict) or entry.get("kind") != expected_kind:
+            raise RuntimeError(f"visual cache miss for {expected_kind}_id")
+        age = now - float(entry.get("capturedAt") or 0.0)
+        if not 0 <= age <= VISUAL_CACHE_TTL_SECONDS:
+            VISUAL_CACHE.pop(token, None)
+            raise RuntimeError(f"stale visual target: {expected_kind} cache TTL expired")
     if not validate_live:
         return entry
     selector = qualify_address(entry["address"], entry["pid"], entry["starttime"])
@@ -2729,7 +2989,7 @@ def hyprctl_json(*args: str) -> Any:
     if not hyprctl:
         raise RuntimeError("hyprctl is unavailable; a running Hyprland session and hyprctl in PATH are required for this action")
     try:
-        proc = subprocess.run(
+        proc = run_request_process(
             [hyprctl, *args],
             text=True,
             stdout=subprocess.PIPE,
@@ -2819,6 +3079,11 @@ def monitor_position(global_x: float, global_y: float) -> dict[str, Any] | None:
         y = float(monitor.get("y") or 0.0)
         width = float(monitor.get("width") or 0.0)
         height = float(monitor.get("height") or 0.0)
+        scale = float(monitor.get("scale") or 1.0)
+        if int(monitor.get("transform") or 0) % 2:
+            width, height = height, width
+        width = math.floor(width / scale + 0.5)
+        height = math.floor(height / scale + 0.5)
         if x <= global_x < x + width and y <= global_y < y + height:
             return {
                 "name": monitor.get("name"),
@@ -3535,7 +3800,7 @@ def run_atspi_child(mode: str, payload: dict[str, Any], *, timeout: float = 5.0)
     if mode not in ATSPI_CHILD_MODES:
         return {"status": "error", "error": f"unknown AT-SPI child mode: {mode}", "ok": False}
     try:
-        proc = subprocess.run(
+        proc = run_request_process(
             [sys.executable, str(pathlib.Path(__file__).resolve()), mode],
             input=json.dumps(payload, ensure_ascii=False),
             text=True,
@@ -4092,6 +4357,7 @@ def set_clipboard_uri(path: pathlib.Path) -> list[str]:
 
 
 def keyboard(target: str, key: str, modifiers: str = "", x: float | None = None, y: float | None = None) -> dict[str, Any]:
+    key, modifiers = key_from_args({"key": key, "modifiers": modifiers})
     cmd = ["keyboard", "--json", target, "tap", key, modifiers]
     if x is not None or y is not None:
         if x is None or y is None:
@@ -4182,15 +4448,48 @@ def prefer_related_target(target: str, enabled: bool = False) -> tuple[str, dict
     raise RuntimeError("automatic related-window rerouting is disabled; inspect app state and target the popup explicitly")
 
 def key_from_args(args: dict[str, Any]) -> tuple[str, str]:
+    key, modifiers = parse_key_args(args)
+    key = key.strip().casefold()
+    # The native CSV parser historically accepted quoted key fields.
+    if len(key) >= 2 and key.startswith('"') and key.endswith('"'):
+        key = key[1:-1]
+    if len(modifiers) >= 2 and modifiers.startswith('"') and modifiers.endswith('"'):
+        modifiers = modifiers[1:-1]
+    key_aliases = {
+        ",": "comma", "-": "minus", chr(92): "backslash",
+        "control_l": "leftctrl", "control_r": "rightctrl", "del": "delete",
+        "shift_l": "leftshift", "shift_r": "rightshift", "alt_l": "leftalt",
+        "alt_r": "rightalt", "super_l": "leftmeta", "super_r": "rightmeta",
+    }
+    if key in {"+", '"'}:
+        key = "equal" if key == "+" else "apostrophe"
+        modifiers += "+shift"
+    aliases = {
+        "control": "ctrl", "control_l": "ctrl", "control_r": "ctrl", "option": "alt",
+        "alt_l": "alt", "alt_r": "alt", "shift_l": "shift", "shift_r": "shift",
+        "super_l": "super", "super_r": "super", "meta": "super", "win": "super",
+        "cmd": "super", "command": "super",
+    }
+    modifiers = "+".join(dict.fromkeys(aliases.get(part, part)
+                         for part in re.split(r"[+ -]+", modifiers.casefold()) if part))
+    return key_aliases.get(key, key), modifiers
+
+
+def parse_key_args(args: dict[str, Any]) -> tuple[str, str]:
     keycode = args.get("keycode")
     if isinstance(keycode, int):
         if keycode < 0:
             raise RuntimeError("keycode must be non-negative")
         modifiers = args.get("modifiers") if isinstance(args.get("modifiers"), str) else ""
-        return str(keycode), modifiers
+        return f"code:{keycode}", modifiers
 
     keys = args.get("keys")
     if isinstance(keys, str) and keys:
+        keys = keys.strip()
+        if keys in {"+", "-", ","}:
+            return keys, ""
+        if len(keys) >= 2 and keys[-1] in "+-," and keys[-2] in "+-":
+            return keys[-1], keys[:-2]
         parts = [p for p in keys.replace("-", "+").split("+") if p]
         if not parts:
             raise RuntimeError("empty keys shortcut")
@@ -4372,9 +4671,7 @@ def build_app_snapshot(app_query: str) -> dict[str, Any]:
     if related_error:
         snapshot["relatedWindowsError"] = related_error
     attach_active_related_preview(snapshot)
-    cache_id = cache_visual("snapshot", snapshot, snapshot)
-    snapshot["snapshotId"] = cache_id
-    screenshot["id"] = cache_id
+    cache_visual("snapshot", snapshot, snapshot)
     remember_snapshot(app_query, snapshot)
     return snapshot
 
@@ -4757,7 +5054,7 @@ def launch_active_state() -> dict[str, Any]:
         raise RuntimeError("hyprctl not found")
     state = {}
     for query, key in (("activeworkspace", "workspace"), ("activewindow", "window")):
-        proc = subprocess.run([hyprctl, query, "-j"], text=True, stdout=subprocess.PIPE,
+        proc = run_request_process([hyprctl, query, "-j"], text=True, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, env=hyprctl_environment(), check=False, timeout=MAX_TOOL_WAIT_SECONDS)
         if proc.returncode:
             raise RuntimeError(proc.stderr or proc.stdout or f"hyprctl {query} failed")
@@ -4767,7 +5064,20 @@ def launch_active_state() -> dict[str, Any]:
 
 
 def tool_launch_app(args: dict[str, Any]) -> dict[str, Any]:
-    parts, match_query = launch_parts(args)
+    app = str(args.get("app") or "").strip()
+    desktop_id, desktop_fields = launch_desktop_entry(app) or ("", {})
+    parts, match_query = launch_parts(args, desktop_id=desktop_id)
+    executable = executable_basename(parts[0])
+    if executable == "gtk-launch" and not desktop_fields and len(parts) > 1:
+        desktop_id, desktop_fields = launch_desktop_entry(parts[1]) or ("", {})
+        if match_query == executable and desktop_id:
+            match_query = desktop_id
+    startup_class = desktop_fields.get("startupwmclass", "")
+    if executable == "gtk-launch" and desktop_fields.get("exec"):
+        try:
+            executable = executable_basename(shlex.split(desktop_fields["exec"])[0])
+        except (IndexError, ValueError):
+            pass
     workspace = None
     if "workspace" in args:
         if isinstance(args["workspace"], bool) or not isinstance(args["workspace"], (str, int)):
@@ -4784,15 +5094,27 @@ def tool_launch_app(args: dict[str, Any]) -> dict[str, Any]:
         active_before = launch_active_state()
 
     existing = None
+    existing_match = None
     if reuse_existing:
-        try:
-            existing = resolve_hypr_window(match_query)
-        except Exception:
-            pass
+        # Preserve selectors accepted by resolve_hypr_window, including
+        # the legacy title/PID lookup. Reuse never grants launched-only scope.
+        for query in dict.fromkeys((startup_class, match_query, executable)):
+            if not query or query == "gtk-launch":
+                continue
+            try:
+                existing = resolve_hypr_window(query)
+            except RuntimeError as exc:
+                if not is_app_not_found_error(exc):
+                    raise
+            else:
+                existing_match = launch_window_match(existing, match_query, startup_class=startup_class,
+                                                     executable=executable) or "selector"
+                break
     if existing is not None:
         result = {
             "ok": True,
             "reused": True,
+            "matchedBy": "existing-" + existing_match,
             "app": match_query,
             "target": window_selector(existing),
             "window": existing,
@@ -4813,18 +5135,23 @@ def tool_launch_app(args: dict[str, Any]) -> dict[str, Any]:
                                "focusMoved": active_before["window"] != active_after["window"],
                                "workspaceVerified": workspace_matches(existing.get("workspace") or {}, workspace)})
                 result["ok"] = not result["activeWorkspaceChanged"] and not result["focusMoved"]
-        return mcp_text(json.dumps(result, ensure_ascii=False), structured=result)
+        return mcp_text(json.dumps(result, ensure_ascii=False), is_error=not result["ok"], structured=result)
 
     before = list_hypr_windows()
     before_ids = window_identities(before)
     command = launch_command_string(parts)
     if workspace is not None:
         require_resulting_workspace_scope(workspace)
-    output = hyprctl_exec(command, workspace) if workspace is not None else hyprctl_exec(command)
-    window, new_windows = wait_for_launch_window(before_ids, match_query, timeout, allow_existing_fallback=reuse_existing)
+    process_token = secrets.token_hex(16)
+    dispatch_command = launch_command_string(parts, process_token=process_token)
+    output = hyprctl_exec(dispatch_command, workspace) if workspace is not None else hyprctl_exec(dispatch_command)
+    window, new_windows, matched_by = wait_for_launch_window(
+        before_ids, match_query, timeout, allow_existing_fallback=reuse_existing,
+        process_token=process_token, startup_class=startup_class, executable=executable,
+    )
     result: dict[str, Any] = {
-        "ok": True,
-        "reused": False,
+        "ok": window is not None,
+        "reused": bool(matched_by and matched_by.startswith("existing-")),
         "app": match_query,
         "command": command,
         "argv": parts,
@@ -4833,37 +5160,42 @@ def tool_launch_app(args: dict[str, Any]) -> dict[str, Any]:
             "environment": A11Y_LAUNCH_ENV,
             "chromiumLikeFlagsApplied": launch_is_chromium_like(parts),
         },
-        "newWindows": new_windows,
+        "newWindows": [candidate for candidate in new_windows if not SECURITY_POLICY.privacy_excluded(candidate)],
     }
     if window is not None:
+        result["matchedBy"] = matched_by
         if SECURITY_POLICY.privacy_excluded(window):
-            result = {"ok": True, "reused": False, "privacyExcluded": True}
+            result = {"ok": True, "reused": result["reused"], "privacyExcluded": True}
+        elif matched_by == "closed-new-window":
+            result["targetClosed"] = True
+            result["warning"] = "A new Hyprland window appeared and closed during launch."
         else:
             result["target"] = window_selector(window)
-            result["session"] = session_action("begin", window_selector(window))
+            if matched_by != "new-window":
+                result["session"] = session_action("begin", window_selector(window))
             # Read back placement after mapping/session sync, not the launch poll.
             window = resolve_hypr_window(window_selector(window))
             result["window"] = window
             result["workspace"] = window.get("workspace")
             result["next"] = f'Call get_app_state with app="{window_selector(window)}" or app="{match_query}".'
     else:
-        result["warning"] = "No Hyprland window appeared before timeout; use list_apps to inspect current windows."
+        result["warning"] = "No new or matching existing Hyprland window appeared before timeout; use list_apps to inspect current windows."
     if workspace is not None and not result.get("privacyExcluded"):
         result.setdefault("workspace", None)
         active_after = launch_active_state()
-        placement_ok = window is not None and workspace_matches(window.get("workspace") or {}, workspace)
+        placement_ok = window is not None and not result.get("targetClosed") and workspace_matches(window.get("workspace") or {}, workspace)
         result.update({
-            "placement": "exec-rule", "requestedWorkspace": workspace,
+            "placement": "reused-existing" if result["reused"] else "exec-rule", "requestedWorkspace": workspace,
             "activeWorkspaceBefore": active_before["workspace"], "activeWorkspaceAfter": active_after["workspace"],
             "activeWindowBefore": active_before["window"], "activeWindowAfter": active_after["window"],
             "activeWorkspaceChanged": active_before["workspace"] != active_after["workspace"],
             "focusMoved": active_before["window"] != active_after["window"],
             "workspaceVerified": placement_ok,
         })
-        result["ok"] = bool(placement_ok and not result["activeWorkspaceChanged"] and not result["focusMoved"])
+        result["ok"] = bool((placement_ok or result["reused"]) and not result["activeWorkspaceChanged"] and not result["focusMoved"])
         if not result["ok"]:
             result["warning"] = "Workspace launch post-check failed; inspect placement and active-state fields."
-    return mcp_text(json.dumps(result, ensure_ascii=False), structured=result)
+    return mcp_text(json.dumps(result, ensure_ascii=False), is_error=not result["ok"], structured=result)
 
 
 def tool_get_app_state(args: dict[str, Any]) -> dict[str, Any]:
@@ -4903,6 +5235,8 @@ def tool_screenshot(args: dict[str, Any]) -> dict[str, Any]:
     cursor_source = args.get("cursor_source")
     if isinstance(cursor_source, str) and cursor_source:
         cmd.extend(["--cursor-source", cursor_source])
+    elif args.get("show_cursor") is True:
+        cmd.extend(["--cursor-source", "auto"])
     info, data = consume_screenshot_result(call_ctl(cmd))
     raw = base64.b64decode(data, validate=True)
     output_format = str(args.get("format") or "png").lower()
@@ -5026,7 +5360,7 @@ def semantic_click(args: dict[str, Any]) -> dict[str, Any]:
                 if mode == "atspi":
                     raise RuntimeError("AT-SPI element action failed; use element_click_mode=pointer for native pointer click")
 
-    action = "doubleclick" if click_count > 1 and button == "left" else "click"
+    action = {2: "doubleclick", 3: "tripleclick"}.get(click_count, "click")
     ctl_args, pointer_info = pointer_ctl_args(snapshot, float(x), float(y), coordinate_space, action, button)
     info: dict[str, Any] = {
         "method": "pointer",
@@ -5040,14 +5374,13 @@ def semantic_click(args: dict[str, Any]) -> dict[str, Any]:
         info.update(refresh_info)
     if element is not None:
         info["clickedElement"] = compact_element_info(element, float(x), float(y), coordinate_space)
-    for index in range(max(1, click_count)):
-        if action == "doubleclick":
-            break
+    if click_count in {2, 3}:
         call_ctl(ctl_args)
-        if index + 1 < click_count:
-            time.sleep(0.12)
-    if action == "doubleclick":
-        call_ctl(ctl_args)
+    else:
+        for index in range(max(1, click_count)):
+            call_ctl(ctl_args)
+            if index + 1 < click_count:
+                time.sleep(0.12)
     return mcp_snapshot_result(snapshot_after_action(app, snapshot, info))
 
 
@@ -5321,6 +5654,7 @@ def semantic_set_value(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def active_sequence_checkpoint() -> None:
+    request_checkpoint()
     if ACTIVE_SEQUENCE_CANCELLATION is None:
         return
     if ACTIVE_SEQUENCE_CANCELLATION.cancelled:
@@ -5422,17 +5756,13 @@ def semantic_wait_for_window(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def target_exists(target: str) -> bool:
-    address = target_address(target)
-    if not address:
-        try:
-            resolve_hypr_window(target)
-            return True
-        except Exception:
+    try:
+        resolve_hypr_window(target)
+        return True
+    except RuntimeError as exc:
+        if is_app_not_found_error(exc):
             return False
-    for window in list_hypr_windows():
-        if address and normalize(window.get("address")) == address:
-            return True
-    return False
+        raise
 
 
 def semantic_wait_for_close(args: dict[str, Any]) -> dict[str, Any]:
@@ -5446,8 +5776,14 @@ def semantic_wait_for_close(args: dict[str, Any]) -> dict[str, Any]:
         if SECURITY_POLICY.privacy_excluded(related_window):
             raise RuntimeError("related_to window is privacy-excluded")
     try:
-        address = str(resolve_hypr_window(target).get("address") or "")
-    except Exception:
+        window = resolve_hypr_window(target)
+        if SECURITY_POLICY.privacy_excluded(window):
+            raise RuntimeError("wait_for_close target is privacy-excluded")
+        address = str(window.get("address") or "")
+        target = window_selector(window)
+    except RuntimeError as exc:
+        if not is_app_not_found_error(exc):
+            raise
         address = target_address(target)
     event_result: dict[str, Any] = {"method": "existing", "eventDriven": False}
     if target_exists(target):
@@ -5516,9 +5852,9 @@ def accessibility_diagnostics(target: str | None = None) -> dict[str, Any]:
             "Keep Hyprland screenshots enabled; AT-SPI is an enhancement, not the capture source.",
         ],
     }
-    proc = subprocess.run(["busctl", "--user", "--list"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=resolved_env, check=False)
+    proc = run_request_process(["busctl", "--user", "--list"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=resolved_env, check=False, timeout=5)
     diag["org.a11y.Bus"] = proc.returncode == 0 and "org.a11y.Bus" in proc.stdout
-    gsettings = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "toolkit-accessibility"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=resolved_env, check=False)
+    gsettings = run_request_process(["gsettings", "get", "org.gnome.desktop.interface", "toolkit-accessibility"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=resolved_env, check=False, timeout=5)
     if gsettings.returncode == 0:
         diag["toolkitAccessibility"] = gsettings.stdout.strip()
     if target:
@@ -5628,12 +5964,12 @@ def tool_panic(args: dict[str, Any]) -> dict[str, Any]:
             if ACTIVE_SEQUENCE_CANCELLATION is not None:
                 ACTIVE_SEQUENCE_CANCELLATION.cancel("panic requested")
         SNAPSHOTS.clear()
-        VISUAL_CACHE.clear()
+        clear_visual_cache()
     elif mode == "cancel":
         # One-shot cancellation stops in-flight native work but deliberately
         # does not create a cross-path latch or synthetic human cooldown.
         SNAPSHOTS.clear()
-        VISUAL_CACHE.clear()
+        clear_visual_cache()
         with SEQUENCE_STATE_LOCK:
             if ACTIVE_SEQUENCE_CANCELLATION is not None:
                 ACTIVE_SEQUENCE_CANCELLATION.cancel("cancel requested")
@@ -6122,16 +6458,12 @@ def tool_manage_workspace(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_sequence(args: dict[str, Any]) -> dict[str, Any]:
-    global ACTIVE_SEQUENCE_CANCELLATION, PENDING_SEQUENCE_CANCEL, SEQUENCE_WORKER_PENDING
-    token = CancellationToken()
+    global ACTIVE_SEQUENCE_CANCELLATION
+    token = REQUEST_CANCELLATION.get() or CancellationToken()
     with SEQUENCE_STATE_LOCK:
-        SEQUENCE_WORKER_PENDING = False
         if ACTIVE_SEQUENCE_CANCELLATION is not None:
             raise RuntimeError("sequence_active: another action sequence is already running")
         ACTIVE_SEQUENCE_CANCELLATION = token
-        if PENDING_SEQUENCE_CANCEL:
-            token.cancel("cancelled before sequence startup")
-            PENDING_SEQUENCE_CANCEL = False
     raw_steps = args.get("steps") or []
     if len(json.dumps(raw_steps, ensure_ascii=False).encode("utf-8")) > 1024 * 1024:
         with SEQUENCE_STATE_LOCK:
@@ -6153,6 +6485,11 @@ def tool_sequence(args: dict[str, Any]) -> dict[str, Any]:
     started = time.monotonic()
 
     def panic_probe() -> bool:
+        deadline = REQUEST_DEADLINE.get()
+        if deadline is not None and time.monotonic() >= deadline:
+            token.cancel("tool request deadline exceeded")
+        if token.cancelled:
+            return token.reason == "panic requested"
         return bool(collect_runtime_guards().panic_active)
 
     def execute_step(step: Any, context: Any) -> dict[str, Any]:
@@ -6379,7 +6716,7 @@ def _computer(args: dict[str, Any]) -> dict[str, Any]:
         return tool_get_cursor_position(args)
     if action in {"left_click", "right_click", "middle_click", "double_click", "triple_click", "hover"}:
         mapped = dict(args)
-        mapped["action"] = "move" if action == "hover" else ("doubleclick" if action in {"double_click", "triple_click"} else "click")
+        mapped["action"] = "move" if action == "hover" else ({"double_click": "doubleclick", "triple_click": "tripleclick"}.get(action, "click"))
         mapped["button"] = {
             "left_click": "left",
             "right_click": "right",
@@ -6401,23 +6738,28 @@ def _computer(args: dict[str, Any]) -> dict[str, Any]:
         args = mapped
         action = "drag"
 
-    target = args.get("target")
+    target = args.get("target") or args.get("app")
     coordinate_space = normalize(args.get("coordinate_space") or "screenshot")
     if (
         isinstance(target, str)
         and target
-        and not isinstance(args.get("app"), str)
-        and coordinate_space in {"screenshot", "window", "screenshot-pixel", "screenshot-pixels", "image", "pixel", "pixels", "window-relative", "window-logical", "logical"}
+        and coordinate_space.replace("_", "-") in {"screenshot", "window", "screenshot-pixel", "screenshot-pixels", "image", "pixel", "pixels", "window-relative", "window-logical", "logical"}
     ):
         mapped = dict(args)
         mapped["app"] = target
+        mapped.setdefault("mouse_button", mapped.get("button"))
         if action == "move":
             return semantic_hover(mapped)
         if action == "click":
             return semantic_click(mapped)
-        if action == "doubleclick":
-            mapped["click_count"] = 2
+        if action in {"doubleclick", "tripleclick"}:
+            mapped["click_count"] = 3 if action == "tripleclick" else 2
             return semantic_click(mapped)
+        if action in {"press", "release"}:
+            snapshot = current_snapshot(target)
+            x, y = require_xy(args)
+            cmd, _ = pointer_ctl_args(snapshot, x, y, coordinate_space, action, str(args.get("button") or "left"))
+            return result_text(call_ctl(cmd))
         if action == "scroll":
             if "direction" not in mapped and isinstance(args.get("scroll_direction"), str):
                 mapped["direction"] = args.get("scroll_direction")
@@ -6430,35 +6772,6 @@ def _computer(args: dict[str, Any]) -> dict[str, Any]:
             if "coordinate" not in mapped and isinstance(args.get("x2"), (int, float)) and isinstance(args.get("y2"), (int, float)):
                 mapped["coordinate"] = [float(args["x2"]), float(args["y2"])]
             return semantic_drag(mapped)
-
-    if action == "screenshot":
-        cmd = screenshot_command_base()
-        target = args.get("target")
-        app = args.get("app")
-        if (not isinstance(target, str) or not target) and isinstance(app, str) and app:
-            target = window_selector(resolve_hypr_window(app))
-        if isinstance(target, str) and target:
-            cmd.extend(["--target", target])
-        else:
-            require_safe_full_capture(target)
-        show_cursor = args.get("show_cursor")
-        if show_cursor is False:
-            cmd.append("--no-cursor")
-        cursor_source = args.get("cursor_source")
-        if isinstance(cursor_source, str) and cursor_source:
-            cmd.extend(["--cursor-source", cursor_source])
-        elif show_cursor is True:
-            cmd.extend(["--cursor-source", "auto"])
-        info, data = consume_screenshot_result(call_ctl(cmd))
-        text = json.dumps(info, ensure_ascii=False)
-        return {
-            "content": [
-                {"type": "text", "text": text},
-                {"type": "image", "mimeType": "image/png", "data": data},
-            ],
-            "structuredContent": info,
-            "isError": False,
-        }
 
     if action == "windows":
         cmd = ["windows"]
@@ -6479,7 +6792,7 @@ def _computer(args: dict[str, Any]) -> dict[str, Any]:
             cmd.append(target)
         return result_text(call_ctl(cmd))
 
-    if action in {"move", "click", "doubleclick", "press", "release"}:
+    if action in {"move", "click", "doubleclick", "tripleclick", "press", "release"}:
         target = require_target(args)
         x, y = require_xy(args)
         button = args.get("button") or "left"
@@ -6583,9 +6896,7 @@ def _computer(args: dict[str, Any]) -> dict[str, Any]:
         return result_text(paste(target, args, set_clipboard_bytes(path.read_bytes(), mime)))
 
     if action == "wait":
-        duration = bounded_timeout_seconds(args.get("duration", 1), 1.0)
-        time.sleep(duration)
-        return result_text({"ok": True, "duration": duration})
+        return semantic_wait(args)
 
     if action == "doctor":
         target = args.get("target")
@@ -6916,6 +7227,14 @@ def action_is_high_risk(action: str, args: dict[str, Any], *, allow_fresh_intent
         key_name, modifiers = key_from_args(args)
     except Exception:
         key_name, modifiers = str(args.get("keys") or args.get("key") or ""), str(args.get("modifiers") or "")
+    if any(char in key_name or char in modifiers for char in (",", '"', chr(92))):
+        return True
+    if re.fullmatch(r"f0*4", key_name):
+        key_name = "f4"
+    if key_name.startswith("code:") or (len(key_name) > 1 and key_name.isdecimal()):
+        raw_code = key_name.removeprefix("code:")
+        key_name = {"14": "backspace", "62": "f4", "17": "w", "111": "delete"}.get(
+            raw_code.lstrip("0"), key_name)
     modifier_parts = [part for part in re.split(r"[+\-\s]+", modifiers.casefold()) if part]
     modifier_parts = ["ctrl" if part == "control" else part for part in modifier_parts]
     modifier_parts.sort(key=lambda part: ({"ctrl": 0, "alt": 1, "shift": 2, "super": 3}.get(part, 9), part))
@@ -6989,6 +7308,8 @@ def prepare_execution_args(tool_name: str, args: dict[str, Any]) -> tuple[dict[s
         try:
             window = resolve_hypr_window(value)
         except Exception as exc:
+            if action == "wait_for_close" and len(selectors) == 1 and is_app_not_found_error(exc):
+                return prepared, None
             prefix = "identity_unavailable_for_dry_run" if SECURITY_POLICY.config.dry_run else "target identity unavailable for policy evaluation"
             raise RuntimeError(f"{prefix}: {exc}") from exc
         resolved.append((key, WindowIdentity.from_window(window)))
@@ -7100,9 +7421,12 @@ def build_security_request(
         try:
             target = security_target(args, resolve=True)
         except Exception as exc:
-            if SECURITY_POLICY.config.dry_run or dry_run_preview:
+            if action == "wait_for_close" and is_app_not_found_error(exc):
+                target = None
+            elif SECURITY_POLICY.config.dry_run or dry_run_preview:
                 raise RuntimeError(f"identity_unavailable_for_dry_run: {exc}") from exc
-            raise
+            else:
+                raise
     scope_targets = resulting_scope_targets(action, args, target)
     # Confirmation contexts are hashed inside SecurityPolicy and never written
     # verbatim to the audit log. Include the full action payload so a token
@@ -7237,8 +7561,10 @@ def newly_launched_window(result: Any) -> dict[str, Any] | None:
     pre-existing window.  Only a selected window also present in the launch
     result's `newWindows` provenance set may gain launched-only scope.
     """
-    structured = result.get("structuredContent") if isinstance(result, dict) else None
-    if not isinstance(structured, dict) or structured.get("reused") is not False:
+    structured = result.get("structuredContent") if isinstance(result, dict) and not result.get("isError") else None
+    if not isinstance(structured, dict) or structured.get("reused") is not False or structured.get("ok") is False:
+        return None
+    if structured.get("matchedBy") == "new-window":
         return None
     selected = structured.get("window")
     candidates = structured.get("newWindows")
@@ -7269,15 +7595,24 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
         return response(req_id, {"tools": tool_definitions()})
 
     if method == "tools/call":
-        params = message.get("params") or {}
+        params = message.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return error(req_id, -32602, "tools/call params must be an object")
         name = params.get("name")
-        args = params.get("arguments") or {}
+        args = params.get("arguments")
+        if args is None:
+            args = {}
+        if not isinstance(name, str) or not isinstance(args, dict):
+            return error(req_id, -32602, "tools/call requires a string name and object arguments")
         if name != "computer" and name not in SEMANTIC_TOOLS:
             return response(req_id, {"content": [{"type": "text", "text": "unknown tool"}], "isError": True})
         request: ActionRequest | None = None
         execution_args = dict(args)
         execution_identity: WindowIdentity | None = None
         try:
+            request_checkpoint()
             execution_args, execution_identity = prepare_execution_args(str(name), args)
             request = build_security_request(str(name), execution_args, resolved_target=execution_identity)
             if request.action == "panic":
@@ -7302,6 +7637,7 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
                 return response(req_id, result)
 
             def invoke() -> dict[str, Any]:
+                request_checkpoint()
                 if name == "computer":
                     return computer(execution_args)
                 return SEMANTIC_TOOLS[str(name)](execution_args)
@@ -7313,6 +7649,8 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
             else:
                 revalidate_execution_identity(execution_identity)
                 result = invoke()
+            if not is_sequence:
+                request_checkpoint()
             if request.action in {"launch", "launch_app", "open_app"}:
                 launched_window = newly_launched_window(result)
                 if launched_window is not None:
@@ -7350,31 +7688,34 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
                     pass
             return response(req_id, result)
 
-    if method and method.startswith("notifications/"):
-        global PENDING_SEQUENCE_CANCEL
-        if method in {"notifications/turn-ended", "notifications/cancelled"}:
-            SNAPSHOTS.clear()
-            VISUAL_CACHE.clear()
-            with SEQUENCE_STATE_LOCK:
-                if ACTIVE_SEQUENCE_CANCELLATION is not None:
-                    ACTIVE_SEQUENCE_CANCELLATION.cancel(str(method))
-                elif method == "notifications/cancelled" and SEQUENCE_WORKER_PENDING:
-                    PENDING_SEQUENCE_CANCEL = True
+    if isinstance(method, str) and method.startswith("notifications/"):
         return None
 
     return error(req_id, -32601, f"method not found: {method}")
 
 
 def stdio_main() -> int:
-    global SEQUENCE_WORKER_PENDING
     ensure_session_environment()
     output_lock = threading.Lock()
-    workers: list[threading.Thread] = []
+    output_closed = threading.Event()
+    pending_lock = threading.Lock()
+    emergency_complete = threading.Event()
+    emergency_complete.set()
+    queued_stops = 0
+    pending: dict[str | int, CancellationToken | None] = {}
+    normal_queue: queue.Queue = queue.Queue(128)
+    emergency_queue: queue.Queue = queue.Queue(16)
 
     def emit(out: dict[str, Any] | None) -> None:
         if out is not None:
             with output_lock:
-                print(json.dumps(out, ensure_ascii=False), flush=True)
+                if output_closed.is_set():
+                    return
+                try:
+                    print(json.dumps(out, ensure_ascii=False), flush=True)
+                except BrokenPipeError:
+                    output_closed.set()
+                    cancel_requests("stdio output closed")
 
     def run_message(msg: dict[str, Any]) -> None:
         try:
@@ -7382,32 +7723,113 @@ def stdio_main() -> int:
         except Exception as exc:
             emit(error(msg.get("id"), -32603, str(exc)))
 
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            msg = json.loads(line)
-        except Exception as exc:
-            emit(error(None, -32700, str(exc)))
-            continue
-        params = msg.get("params") if isinstance(msg, dict) else None
-        name = params.get("name") if isinstance(params, dict) else None
-        arguments = params.get("arguments") if isinstance(params, dict) else None
-        is_sequence_call = msg.get("method") == "tools/call" and (
-            name == "sequence"
-            or (name == "computer" and isinstance(arguments, dict) and arguments.get("action") == "sequence")
-        )
-        if is_sequence_call:
-            with SEQUENCE_STATE_LOCK:
-                SEQUENCE_WORKER_PENDING = True
-            worker = threading.Thread(target=run_message, args=(msg,), name="hypr-agent-portal-sequence", daemon=False)
-            workers.append(worker)
-            worker.start()
-        else:
-            run_message(msg)
-        workers = [worker for worker in workers if worker.is_alive()]
+    def cancel_requests(reason: str, request_id: str | int | None = None) -> None:
+        with pending_lock:
+            tokens = list(pending.values()) if request_id is None else [pending.get(request_id)]
+            for token in tokens:
+                if token is not None:
+                    token.cancel(reason)
+
+    def consume(inbox: queue.Queue) -> None:
+        nonlocal queued_stops
+        while (item := inbox.get()) is not None:
+            msg, cancellation, stop = item
+            if cancellation is not None:
+                while not cancellation.cancelled and not emergency_complete.wait(0.1):
+                    pass
+            context = REQUEST_CANCELLATION.set(cancellation)
+            params = msg.get("params")
+            is_sequence = isinstance(params, dict) and (
+                params.get("name") == "sequence" or
+                (params.get("name") == "computer" and isinstance(params.get("arguments"), dict) and
+                 normalize(params["arguments"].get("action")) == "sequence")
+            )
+            deadline = REQUEST_DEADLINE.set(time.monotonic() + MAX_TOOL_WAIT_SECONDS if is_sequence else None)
+            try:
+                run_message(msg)
+            finally:
+                REQUEST_DEADLINE.reset(deadline)
+                REQUEST_CANCELLATION.reset(context)
+                with pending_lock:
+                    pending.pop(msg["id"], None)
+                    if stop:
+                        queued_stops -= 1
+                        if queued_stops == 0:
+                            emergency_complete.set()
+
+    workers = [
+        threading.Thread(target=consume, args=(normal_queue,), name="hypr-agent-portal-tools"),
+        threading.Thread(target=consume, args=(emergency_queue,), name="hypr-agent-portal-emergency"),
+    ]
     for worker in workers:
-        worker.join()
+        worker.start()
+    try:
+        for line in sys.stdin:
+            if output_closed.is_set():
+                break
+            if not line.strip():
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError as exc:
+                emit(error(None, -32700, str(exc)))
+                continue
+            if not isinstance(msg, dict) or not isinstance(msg.get("method"), str):
+                emit(error(None, -32600, "invalid JSON-RPC request"))
+                continue
+            method = msg["method"]
+            request_id = msg.get("id")
+            if request_id is not None and type(request_id) not in (str, int):
+                emit(error(None, -32600, "invalid JSON-RPC request ID"))
+                continue
+            params = msg.get("params", {})
+            if method == "notifications/cancelled":
+                cancelled_id = params.get("requestId") if isinstance(params, dict) else None
+                if type(cancelled_id) in (str, int):
+                    cancel_requests(method, cancelled_id)
+                continue
+            if method == "notifications/turn-ended":
+                cancel_requests(method)
+                SNAPSHOTS.clear()
+                clear_visual_cache()
+                continue
+            if method != "tools/call":
+                run_message(msg)
+                continue
+            if request_id is None:
+                continue
+            arguments = params.get("arguments") if isinstance(params, dict) else None
+            if arguments is None:
+                arguments = {}
+            name = params.get("name") if isinstance(params, dict) else None
+            mode = str(arguments.get("mode") or "panic").casefold() if name == "panic" and isinstance(arguments, dict) else None
+            emergency = mode in {"panic", "cancel", "status"}
+            stop = mode in {"panic", "cancel"}
+            token = None if emergency else CancellationToken()
+            with pending_lock:
+                if request_id in pending:
+                    rejected = (-32600, "duplicate active request ID")
+                else:
+                    try:
+                        (emergency_queue if emergency else normal_queue).put_nowait((msg, token, stop))
+                    except queue.Full:
+                        rejected = (-32603, "tool request queue is full")
+                    else:
+                        rejected = None
+                        pending[request_id] = token
+                        if stop:
+                            queued_stops += 1
+                            emergency_complete.clear()
+            if rejected:
+                emit(error(request_id, *rejected))
+            elif stop:
+                cancel_requests(f"{mode} requested")
+    finally:
+        cancel_requests("stdio shutdown")
+        for inbox in (emergency_queue, normal_queue):
+            inbox.put(None)
+        for worker in workers:
+            worker.join()
     return 0
 
 
@@ -7418,20 +7840,17 @@ def main() -> int:
     try:
         return stdio_main()
     finally:
-        # On exceptional shutdown stop/join the sequence before retiring its
-        # visualization, so a late worker cannot recreate the cursor afterward.
-        global PENDING_SEQUENCE_CANCEL
-        PENDING_SEQUENCE_CANCEL = True
-        with SEQUENCE_STATE_LOCK:
-            if ACTIVE_SEQUENCE_CANCELLATION is not None:
-                ACTIVE_SEQUENCE_CANCELLATION.cancel("stdio shutdown")
-        for worker in threading.enumerate():
-            if worker.name == "hypr-agent-portal-sequence" and worker is not threading.current_thread():
-                worker.join()
+        if SESSION_CLEANUP_NEEDED:
+            try:
+                call_ctl(["session", "--json", "end"])
+            except Exception as exc:
+                print(f"workspace and input cleanup failed: {type(exc).__name__}", file=sys.stderr)
         try:
-            end_own_agent_cursor()
+            if CURSOR_TOUCHED and not CURSOR_ENDED:
+                end_own_agent_cursor()
         except Exception as exc:
             print(f"cursor cleanup failed: {type(exc).__name__}", file=sys.stderr)
+        clear_visual_cache()
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
 

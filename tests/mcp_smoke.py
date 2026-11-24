@@ -114,7 +114,7 @@ def main() -> int:
         "manage_workspace",
     }
     assert set(tools_by_name) == expected_tools
-    assert lines[0]["result"]["serverInfo"]["version"] == "0.4.0"
+    assert lines[0]["result"]["serverInfo"]["version"] == "0.5.0"
     actions = set(tools_by_name["computer"]["inputSchema"]["properties"]["action"]["enum"])
     for action in ["screenshot", "windows", "click", "scroll", "drag", "key", "type", "paste_image", "session", "get_app_state", "read_app_state", "wait", "wait_for_window", "wait_for_close", "doctor", "launch", "launch_app", "open_app", "get_cursor_position", "activate_menu_item", "left_click", "left_click_drag", "hover", "ocr", "click_text", "get_marks", "click_mark", "type_into", "sequence", "manage_window", "list_workspaces", "manage_workspace"]:
         assert action in actions

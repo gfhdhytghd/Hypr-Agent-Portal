@@ -1,6 +1,6 @@
 {
   "name": "hypr-agent-portal",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "hypr-agent-portal MCP only. Hyprland background screenshot, input, clipboard, browser/Chromium control, app-state, and visible agent cursor bridge. Do not use Browser MCP when the user explicitly asks for hypr-agent-portal. Do not use the obsolete hyprcum server.",
   "mcpServers": "./.mcp.json",
   "interface": {

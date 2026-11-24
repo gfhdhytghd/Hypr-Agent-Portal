@@ -7,6 +7,39 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-24
+
+### Added
+
+- Show a configurable session cursor and action feedback on the controlled
+  window, with themes and reduced-motion support.
+- Launch apps on numbered, named, or special workspaces without switching
+  workspaces or taking focus. Launch results report how the window matched
+  and where it opened.
+- Track related windows across all input actions, including dialogs opened
+  by keyboard input. Existing windows keep their workspaces.
+
+### Changed
+
+- Target official Hyprland v0.57.2 and its Lua dispatcher API.
+- Make MCP security policy enforcement opt-in. Set
+  `HYPR_AGENT_PORTAL_SECURITY_ENABLED=1` to use policy features such as
+  read-only mode, dry-run, confinement, and physical confirmation.
+- Report native dispatcher errors and asynchronous completion through the
+  CLI and MCP bridge. Older plugins can still send unversioned replies.
+  Upgrade the plugin and MCP bridge together to get verified native results.
+
+### Fixed
+
+- Keep emergency stop responsive during long requests. Release held buttons
+  and keys on cancellation or cleanup, and wait for timed drags and
+  multi-clicks to complete on the new plugin.
+- Keep rotated monitor screenshots upright. Report missing outputs and
+  handle different output heights when stitching screenshots.
+- Improve post-launch window matching and report failed verification as an
+  error. Treat an already closed window as success in `wait_for_close`.
+- Enforce the pending confirmation limit across concurrent requests.
+
 ## [0.4.0] - 2026-08-31
 
 ### Added
@@ -96,7 +129,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Stabilize element geometry, menu activation, input focus, text paste, and
   action-result verification.
 
-[Unreleased]: https://github.com/gfhdhytghd/Hypr-Agent-Portal/compare/v0.4.0-0.56...HEAD
+[Unreleased]: https://github.com/gfhdhytghd/Hypr-Agent-Portal/compare/v0.5.0-v0.57.2...HEAD
+[0.5.0]: https://github.com/gfhdhytghd/Hypr-Agent-Portal/compare/v0.4.0-0.56...v0.5.0-v0.57.2
 [0.4.0]: https://github.com/gfhdhytghd/Hypr-Agent-Portal/compare/v0.3.47-0.56...v0.4.0-0.56
 [0.3.47]: https://github.com/gfhdhytghd/Hypr-Agent-Portal/compare/v0.3.45-0.55...v0.3.47-0.56
 [0.3.45]: https://github.com/gfhdhytghd/Hypr-Agent-Portal/releases/tag/v0.3.45-0.55

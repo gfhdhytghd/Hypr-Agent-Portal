@@ -62,7 +62,7 @@ jobs:
           import pathlib
           import re
 
-          expected = "0.4.0"
+          expected = "0.5.0"
           server = json.loads(pathlib.Path("server.json").read_text())
           pyproject = pathlib.Path("pyproject.toml").read_text()
           project_name = re.search(r'^name = "([^"]+)"$', pyproject, re.MULTILINE).group(1)

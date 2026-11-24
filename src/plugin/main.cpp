@@ -3399,7 +3399,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         .name = "hypr-agent-portal",
         .description = "Background screenshot, pointer, keyboard, workspace guard, and backend-independent visible agent cursor primitives for Hyprland agents",
         .author = "wilf",
-        .version = "0.4.0",
+        .version = "0.5.0",
     };
 }
 

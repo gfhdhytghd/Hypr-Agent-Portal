@@ -50,6 +50,10 @@ For apps that spawn visible helper windows or dialogs during background control,
 
 ## Build
 
+For official Hyprland v0.57.2, use the
+[0.5.0 release](https://github.com/gfhdhytghd/Hypr-Agent-Portal/releases/tag/v0.5.0-v0.57.2).
+The build instructions below target upstream Hyprland `main`.
+
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
@@ -87,7 +91,16 @@ hyprpm reload
 
 ## MCP
 
-The repository includes a Codex plugin manifest and a stdio MCP server:
+Upgrade the Hyprland plugin and MCP bridge together. The new CLI and MCP
+bridge still accept unversioned replies from older plugins. Install the
+downloaded release wheel and start the bridge with:
+
+```sh
+python3 -m pip install ./hypr_agent_portal-0.5.0-py3-none-any.whl
+hypr-agent-portal
+```
+
+The repository also includes a Codex plugin manifest and a stdio MCP server:
 
 ```sh
 python3 mcp/hypr-agent-portal-mcp.py
@@ -527,7 +540,7 @@ scripts/hypr-agent-portalctl panic status
 
 ## Known Issues
 
-- The 0.4.0 visual, socket2, sequence, and window/workspace paths have headless
+- The visual, socket2, sequence, and window/workspace paths have headless
   regression coverage. CI builds the native plugin against the pinned Hyprland
   revision listed in [Build](#build).
   They have not all been exercised in a live user session for this release;

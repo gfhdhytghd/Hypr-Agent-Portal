@@ -66,7 +66,7 @@ from target_identity import qualify_address, parse_target, strip_target_qualifie
 LEGACY_ENVIRONMENT_USES = promote_legacy_environment()
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 SNAPSHOTS: dict[str, dict[str, Any]] = {}
 VISUAL_CACHE: dict[str, dict[str, Any]] = {}
 VISUAL_CACHE_SPILLED: dict[str, tuple[float, pathlib.Path]] = {}

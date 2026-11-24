@@ -7,8 +7,8 @@ Older releases and untagged development snapshots are not supported.
 
 | Version | Supported |
 | --- | --- |
-| 0.4.0 | Yes |
-| 0.3.47 | No |
+| 0.5.0 | Yes |
+| 0.4.0 | No |
 | Earlier versions | No |
 
 The Hyprland plugin API is version-sensitive. A report is actionable only when
